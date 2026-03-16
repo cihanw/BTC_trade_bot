@@ -6,9 +6,9 @@ from datetime import datetime
 # --- SETTINGS ---
 SYMBOL = "BTCUSDT"          # Pair to download
 START_DATE = "2020-01-01"   # Start date (Year-Month-Day)
-END_DATE = "2026-01-29"     # End date
+END_DATE = "2026-03-01"     # End date
 INTERVAL = "30m"            # Timeframe for klines
-BASE_DIR = r"C:\Users\Bilge\OneDrive\Masaüstü\BTC\data\raw" # Main directory for downloads
+BASE_DIR = r"C:\Users\cihan\441\BTC_trade_bot\data\raw" # Main directory for downloads
 
 # Binance Vision Base URL (Futures - USDT Margined)
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly"

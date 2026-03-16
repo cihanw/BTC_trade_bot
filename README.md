@@ -1,27 +1,39 @@
 # BTC Trade Bot
 
-A Python-based tool for downloading and processing historical cryptocurrency data from Binance Futures.
+Python tabanli bir veri toplama ve birlestirme projesi. Binance Futures verileri ve ek piyasa metrikleri toplanip tek bir islenmis veri setinde birlestirildi.
 
-## Features
+## Son Durum
 
-- Downloads **Klines (Price & Volume)** data (30m interval).
-- Downloads **Funding Rate** data.
-- Handles Monthly Zip file downloads from Binance Vision.
+- Binance **30m Kline** verileri toplandi.
+- Binance **Funding Rate** verileri toplandi.
+- **Open Interest** ve **Long/Short Ratio** verileri eklendi.
+- **CME BTC Futures** verileri projeye dahil edildi.
+- Tum kaynaklar birlestirilerek `data/processed/` altinda merged ciktilar olusturuldu.
 
-## Usage
+## Proje Yapisi
 
-1.  Install dependencies:
-    ```bash
-    pip install pandas requests
-    ```
-2.  Run the downloader script:
-    ```bash
-    python klines_fundingRate_30min.py
-    ```
+- `klines_fundingRate_30min.py`: Kline ve funding rate indirme islemleri
+- `openInterest.py`: Open interest veri islemleri
+- `CME.py`: CME veri cekme ve kaydetme
+- `preprocess1.py`, `preprocess2.py`, `preprocess3.py`: veri temizleme ve merge adimlari
+- `data/raw/`: ham veri dosyalari
+- `data/processed/`: birlestirilmis veri ciktilari
 
-## Roadmap
+## Calistirma
 
-- [x] Klines Download
-- [x] Funding Rate Download
-- [ ] **Open Interest (OI) Data Download** (Next Step)
-    - *Note: Historical OI data is not directly available via simple file download and requires alternative sourcing (e.g., Kaggle or Paid APIs).*
+1. Bagimliliklari kurun:
+   ```bash
+   pip install pandas requests
+   ```
+2. Veri toplama scriptlerini calistirin:
+   ```bash
+   python klines_fundingRate_30min.py
+   python openInterest.py
+   python CME.py
+   ```
+3. On-isleme ve birlestirme adimlarini calistirin:
+   ```bash
+   python preprocess1.py
+   python preprocess2.py
+   python preprocess3.py
+   ```
