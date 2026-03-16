@@ -1,8 +1,9 @@
+import os
 import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-API_KEY = "762c860d-0729-48ed-9f83-9add2b1cb2f2"
+API_KEY = os.getenv("COINALYZE_API_KEY")
 BASE_URL = "https://api.coinalyze.net/v1"
 HEADERS = {"api_key": API_KEY}
 
@@ -16,6 +17,8 @@ def to_timestamp(date_str: str) -> int:
 
 
 def safe_get(endpoint: str, params: dict | None = None):
+    if not API_KEY:
+        raise ValueError("COINALYZE_API_KEY environment variable is not set.")
     url = f"{BASE_URL}/{endpoint}"
     resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
     if resp.status_code != 200:
