@@ -1,37 +1,37 @@
 # BTC Trade Bot
 
-Python tabanli bir veri toplama ve birlestirme projesi. Binance Futures verileri ve ek piyasa metrikleri toplanip tek bir islenmis veri setinde birlestirildi.
+A Python-based data collection and merging project. Binance Futures data and additional market metrics are collected and merged into a single processed dataset.
 
-## Son Durum
+## Current Status
 
-- Binance **30m Kline** verileri toplandi.
-- Binance **Funding Rate** verileri toplandi.
-- **Open Interest** ve **Long/Short Ratio** verileri eklendi.
-- **CME BTC Futures** verileri projeye dahil edildi.
-- Tum kaynaklar birlestirilerek `data/processed/` altinda merged ciktilar olusturuldu.
+- Binance **30m Kline** data has been collected.
+- Binance **Funding Rate** data has been collected.
+- **Open Interest** and **Long/Short Ratio** data has been added.
+- **CME BTC Futures** data has been integrated into the project.
+- All sources were merged, and processed outputs were generated under `data/processed/`.
 
-## Proje Yapisi
+## Project Structure
 
-- `klines_fundingRate_30min.py`: Kline ve funding rate indirme islemleri
-- `openInterest.py`: Open interest veri islemleri
-- `CME.py`: CME veri cekme ve kaydetme
-- `preprocess1.py`, `preprocess2.py`, `preprocess3.py`: veri temizleme ve merge adimlari
-- `data/raw/`: ham veri dosyalari
-- `data/processed/`: birlestirilmis veri ciktilari
+- `klines_fundingRate_30min.py`: Kline and funding rate download operations
+- `openInterest.py`: Open interest processing
+- `CME.py`: CME data fetching and saving
+- `preprocess1.py`, `preprocess2.py`, `preprocess3.py`: Data cleaning and merge steps
+- `data/raw/`: Raw data files
+- `data/processed/`: Merged/processed outputs
 
-## Calistirma
+## Usage
 
-1. Bagimliliklari kurun:
+1. Install dependencies:
    ```bash
    pip install pandas requests
    ```
-2. Veri toplama scriptlerini calistirin:
+2. Run data collection scripts:
    ```bash
    python klines_fundingRate_30min.py
    python openInterest.py
    python CME.py
    ```
-3. On-isleme ve birlestirme adimlarini calistirin:
+3. Run preprocessing and merge steps:
    ```bash
    python preprocess1.py
    python preprocess2.py
