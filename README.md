@@ -37,3 +37,28 @@ A Python-based data collection and merging project. Binance Futures data and add
    python preprocess2.py
    python preprocess3.py
    ```
+
+## Live Demo Bot
+
+- Edit `bot_settings.py` and place your Binance Global demo API key/secret there.
+- Smoke test the live inference pipeline without sending orders:
+  ```bash
+  python live_trading_bot.py --smoke-test
+  ```
+- Start the UI:
+  ```bash
+  python live_trading_bot.py
+  ```
+- Run headless for 24/7 server usage:
+  ```bash
+  python live_trading_bot.py --headless --risk low
+  ```
+
+Running `live_trading_bot.py` now starts a local browser dashboard. You can enter the Binance demo API key/secret directly in the page or leave them blank and use `bot_settings.py` as fallback. The bot rebuilds the training-time scaler from `data/processed/final.csv`, fetches the latest 30m Binance Futures data, derives the model decision, and applies the requested position-management rules on the Binance demo account.
+
+Sizing and exits:
+- `TP` distance uses the model-driven threshold (`barrier_width`).
+- `SL` distance uses `barrier_width * 0.75`.
+- New positions are sized from account equity so that a stop-out targets roughly `3%` account loss, capped by the configured leverage.
+
+For a detailed Google Cloud guide, cron/systemd examples, and billing-check steps, see `CLOUD_DEPLOY.md`.

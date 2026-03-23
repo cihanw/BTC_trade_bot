@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 .vscode/
+.env
+.env.*
+venv/
+.venv/
+runtime/
+logs/
+*.log
+*.pid
