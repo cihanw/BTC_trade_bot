@@ -48,6 +48,7 @@ RISK_LOW = "low"
 MAX_KLINE_LIMIT = 1500
 MAX_FUNDING_LIMIT = 1000
 EIGHT_HOURS_MS = 8 * 60 * 60 * 1000
+KLINE_INTERVAL = "30m"
 
 
 class EncoderOnlyTransformer(nn.Module):
@@ -124,8 +125,8 @@ class RiskProfile:
 RISK_PROFILES = {
     RISK_HIGH: RiskProfile(
         name=RISK_HIGH,
-        long_sell_threshold=0.32,
-        short_buy_threshold=0.32,
+        long_sell_threshold=0.34,
+        short_buy_threshold=0.34,
         flat_keeps_position=True,
         reverse_reopens_position=True,
         same_direction_scale_multiplier=1.5,
@@ -552,7 +553,11 @@ class LiveFeatureAssembler:
         self.daily_provider = DailyFeatureProvider()
 
     def build_live_feature_frame(self, symbol: str) -> pd.DataFrame:
-        klines_df = self.public_client.fetch_recent_klines(symbol=symbol, interval="30m", total_limit=self.history_bars)
+        klines_df = self.public_client.fetch_recent_klines(
+            symbol=symbol,
+            interval=KLINE_INTERVAL,
+            total_limit=self.history_bars,
+        )
         funding_df = self.public_client.fetch_recent_funding_rates(
             symbol=symbol,
             start_time=int(klines_df["open_time"].min()) - EIGHT_HOURS_MS,
@@ -813,11 +818,38 @@ class TradeBotController:
     def run_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                self.housekeep_orders()
-                self.process_if_new_bar()
+                if self.wait_until_next_bar_close():
+                    break
+                while not self.stop_event.is_set():
+                    try:
+                        self.housekeep_orders()
+                        if self.process_if_new_bar():
+                            break
+                        self.logger("Yeni kapanan mum henuz hazir degil; kisa sure sonra tekrar denenecek.")
+                    except Exception as exc:
+                        self.logger(f"Hata: {exc}")
+
+                    if self.stop_event.wait(settings.ERROR_RETRY_SECONDS):
+                        break
             except Exception as exc:
-                self.logger(f"Hata: {exc}")
-            self.stop_event.wait(settings.POLL_INTERVAL_SECONDS)
+                self.logger(f"Kapanis zamani hesaplanamadi: {exc}")
+                if self.stop_event.wait(settings.ERROR_RETRY_SECONDS):
+                    break
+
+    def wait_until_next_bar_close(self) -> bool:
+        interval_ms = settings.BAR_INTERVAL_MINUTES * 60 * 1000
+        buffer_ms = int(settings.BAR_CLOSE_BUFFER_SECONDS * 1000)
+        server_time = self.public_client.get_server_time()
+        next_close_ms = ((server_time // interval_ms) + 1) * interval_ms
+        target_ms = next_close_ms + buffer_ms
+        wait_seconds = max(0.0, (target_ms - server_time) / 1000.0)
+
+        next_close_time = pd.to_datetime(next_close_ms, unit="ms", utc=True).tz_localize(None)
+        self.logger(
+            f"Sonraki {settings.BAR_INTERVAL_MINUTES}m mum kapanisi bekleniyor: "
+            f"{next_close_time:%Y-%m-%d %H:%M}"
+        )
+        return self.stop_event.wait(wait_seconds)
 
     def housekeep_orders(self) -> None:
         position = self.demo_client.get_position(settings.SYMBOL)
@@ -828,7 +860,7 @@ class TradeBotController:
                 self.demo_client.cancel_order(settings.SYMBOL, int(order["orderId"]))
             self.logger(f"Pozisyon yokken kalan {len(bot_orders)} bot emri iptal edildi.")
 
-    def process_if_new_bar(self) -> None:
+    def process_if_new_bar(self) -> bool:
         raw_frame = self.feature_assembler.build_live_feature_frame(settings.SYMBOL)
         raw_frame = raw_frame.dropna(subset=["barrier_width"]).reset_index(drop=True)
         if raw_frame.empty:
@@ -843,8 +875,7 @@ class TradeBotController:
         snapshot.trade_label = label
 
         if self.last_processed_bar is not None and snapshot.bar_time <= self.last_processed_bar:
-            self.logger(f"Ayni mum daha once islendi, atlandi: {snapshot.bar_time:%Y-%m-%d %H:%M}")
-            return
+            return False
 
         self.last_processed_bar = snapshot.bar_time
         self._persist_last_processed_bar(snapshot.bar_time)
@@ -854,6 +885,7 @@ class TradeBotController:
             f"p_down={snapshot.probs['p_down']:.4f} | signal={snapshot.trade_label}"
         )
         self.apply_trade_rules(snapshot)
+        return True
 
     def _load_last_processed_bar(self) -> pd.Timestamp | None:
         try:
@@ -1569,6 +1601,7 @@ def build_dashboard_html() -> str:
     const riskEl = document.getElementById('risk');
     const apiKeyEl = document.getElementById('api-key');
     const apiSecretEl = document.getElementById('api-secret');
+    let riskDirty = false;
 
     function setStatus(text, isWarn) {{
       statusPill.textContent = text;
@@ -1579,7 +1612,10 @@ def build_dashboard_html() -> str:
       const res = await fetch('/api/state');
       const state = await res.json();
       setStatus(state.status, Boolean(state.last_error));
-      riskEl.value = state.risk || 'low';
+      if (state.running || !riskDirty) {{
+        riskEl.value = state.risk || 'low';
+        riskDirty = false;
+      }}
       startBtn.disabled = state.running;
       stopBtn.disabled = !state.running;
 
@@ -1592,6 +1628,10 @@ def build_dashboard_html() -> str:
       }}
     }}
 
+    riskEl.addEventListener('change', () => {{
+      riskDirty = true;
+    }});
+
     async function postJson(path, payload) {{
       const res = await fetch(path, {{
         method: 'POST',
@@ -1603,6 +1643,7 @@ def build_dashboard_html() -> str:
 
     startBtn.addEventListener('click', async () => {{
       startBtn.disabled = true;
+      riskDirty = false;
       const response = await postJson('/api/start', {{
         risk: riskEl.value,
         apiKey: apiKeyEl.value,
