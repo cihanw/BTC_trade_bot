@@ -107,14 +107,23 @@ class RiskProfile:
     name: str
     long_sell_threshold: float
     short_buy_threshold: float
+    max_flat_probability: float | None
+    side_ratio_threshold: float | None
     flat_keeps_position: bool
     reverse_reopens_position: bool
     same_direction_scale_multiplier: float
     same_direction_grows_position: bool
 
     def derive_trade_label(self, p_buy: float, p_hold: float, p_sell: float) -> str:
-        long_mask = (p_sell < self.long_sell_threshold) and (p_buy > p_hold)
-        short_mask = (not long_mask) and (p_buy < self.short_buy_threshold) and (p_sell > p_hold)
+        if self.max_flat_probability is not None and self.side_ratio_threshold is not None:
+            long_mask = (p_hold <= self.max_flat_probability) and (p_buy > self.side_ratio_threshold * p_sell)
+            short_mask = (not long_mask) and (p_hold <= self.max_flat_probability) and (
+                p_sell > self.side_ratio_threshold * p_buy
+            )
+        else:
+            long_mask = (p_sell < self.long_sell_threshold) and (p_buy > p_hold)
+            short_mask = (not long_mask) and (p_buy < self.short_buy_threshold) and (p_sell > p_hold)
+
         if long_mask:
             return "up"
         if short_mask:
@@ -127,6 +136,8 @@ RISK_PROFILES = {
         name=RISK_HIGH,
         long_sell_threshold=0.34,
         short_buy_threshold=0.34,
+        max_flat_probability=0.55,
+        side_ratio_threshold=2.0,
         flat_keeps_position=True,
         reverse_reopens_position=True,
         same_direction_scale_multiplier=1.5,
@@ -134,8 +145,10 @@ RISK_PROFILES = {
     ),
     RISK_LOW: RiskProfile(
         name=RISK_LOW,
-        long_sell_threshold=0.30,
-        short_buy_threshold=0.30,
+        long_sell_threshold=0.34,
+        short_buy_threshold=0.34,
+        max_flat_probability=None,
+        side_ratio_threshold=None,
         flat_keeps_position=False,
         reverse_reopens_position=False,
         same_direction_scale_multiplier=1.0,
