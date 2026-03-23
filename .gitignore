@@ -9,3 +9,6 @@ runtime/
 logs/
 *.log
 *.pid
+AGENTS.md
+CLOUD_DEPLOY.md
+tasks/

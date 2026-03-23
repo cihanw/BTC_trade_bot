@@ -60,5 +60,3 @@ Sizing and exits:
 - `TP` distance uses the model-driven threshold (`barrier_width`).
 - `SL` distance uses `barrier_width * 0.75`.
 - New positions are sized from account equity so that a stop-out targets roughly `3%` account loss, capped by the configured leverage.
-
-For a detailed Google Cloud guide, cron/systemd examples, and billing-check steps, see `CLOUD_DEPLOY.md`.
