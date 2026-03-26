@@ -49,6 +49,8 @@ MAX_KLINE_LIMIT = 1500
 MAX_FUNDING_LIMIT = 1000
 EIGHT_HOURS_MS = 8 * 60 * 60 * 1000
 KLINE_INTERVAL = "30m"
+LEGACY_BINANCE_DEMO_BASE_URL = "https://testnet.binancefuture.com"
+CANONICAL_BINANCE_DEMO_BASE_URL = "https://demo-fapi.binance.com"
 
 
 class EncoderOnlyTransformer(nn.Module):
@@ -215,6 +217,47 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def normalize_demo_base_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized == LEGACY_BINANCE_DEMO_BASE_URL:
+        return CANONICAL_BINANCE_DEMO_BASE_URL
+    return normalized
+
+
+def parse_json_response(response: requests.Response) -> dict | list:
+    if not response.text.strip():
+        return {}
+    return response.json()
+
+
+def build_binance_http_error(
+    method: str,
+    path: str,
+    response: requests.Response,
+    params: dict[str, str | int | float | bool] | None = None,
+) -> RuntimeError:
+    detail_parts = [f"status={response.status_code}"]
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        if payload.get("code") is not None:
+            detail_parts.append(f"code={payload['code']}")
+        if payload.get("msg"):
+            detail_parts.append(f"msg={payload['msg']}")
+    else:
+        body = response.text.strip()
+        if body:
+            detail_parts.append(f"body={body[:400]}")
+
+    if params:
+        detail_parts.append(f"params={params}")
+
+    return RuntimeError(f"Binance API request failed | {method.upper()} {path} | {' | '.join(detail_parts)}")
+
+
 class HybridFeatureNormalizer:
     def __init__(self, final_data_path: Path, config: dict) -> None:
         self.final_data_path = final_data_path
@@ -370,9 +413,24 @@ class BinancePublicDataClient:
         self.session = requests.Session()
 
     def _get(self, path: str, params: dict | None = None) -> dict | list:
-        response = self.session.get(f"{self.base_url}{path}", params=params, timeout=20)
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.base_url}{path}"
+        attempts = settings.PUBLIC_API_MAX_RETRIES + 1
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=settings.HTTP_TIMEOUT_SECONDS)
+                response.raise_for_status()
+                return parse_json_response(response)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"Binance public request failed after {attempt} attempts | GET {path} | reason={exc}"
+                    ) from exc
+                time.sleep(settings.PUBLIC_API_RETRY_BACKOFF_SECONDS * attempt)
+            except requests.HTTPError as exc:
+                raise build_binance_http_error("GET", path, exc.response or response, params) from exc
+
+        raise RuntimeError(f"Binance public request exhausted retries unexpectedly | GET {path}")
 
     def get_server_time(self) -> int:
         payload = self._get("/fapi/v1/time")
@@ -618,7 +676,7 @@ class BinanceDemoClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = base_url.rstrip("/")
+        self.base_url = normalize_demo_base_url(base_url)
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": api_key})
 
@@ -634,9 +692,12 @@ class BinanceDemoClient:
         query = urlencode(payload, doseq=True)
         signature = hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
         url = f"{self.base_url}{path}?{query}&signature={signature}"
-        response = self.session.request(method=method.upper(), url=url, timeout=20)
-        response.raise_for_status()
-        return response.json()
+        response = self.session.request(method=method.upper(), url=url, timeout=settings.HTTP_TIMEOUT_SECONDS)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise build_binance_http_error(method, path, exc.response or response, payload) from exc
+        return parse_json_response(response)
 
     def ensure_one_way_mode(self) -> None:
         payload = self._signed_request("GET", "/fapi/v1/positionSide/dual")
@@ -652,18 +713,40 @@ class BinanceDemoClient:
         payload = self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": symbol})
         return list(payload)
 
+    def get_open_algo_orders(self, symbol: str) -> list[dict]:
+        payload = self._signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        return list(payload)
+
     def cancel_order(self, symbol: str, order_id: int) -> None:
         self._signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
 
+    def cancel_algo_order(self, algo_id: int | None = None, client_algo_id: str | None = None) -> None:
+        params: dict[str, str | int] = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        if not params:
+            raise ValueError("Algo emir iptali icin algo_id veya client_algo_id gerekli.")
+        self._signed_request("DELETE", "/fapi/v1/algoOrder", params)
+
     def cancel_bot_orders(self, symbol: str) -> int:
-        orders = self.get_open_orders(symbol)
         cancelled = 0
-        for order in orders:
+
+        for order in self.get_open_orders(symbol):
             client_order_id = str(order.get("clientOrderId", ""))
             if not client_order_id.startswith(settings.ORDER_CLIENT_PREFIX):
                 continue
             self.cancel_order(symbol, int(order["orderId"]))
             cancelled += 1
+
+        for order in self.get_open_algo_orders(symbol):
+            client_algo_id = str(order.get("clientAlgoId", ""))
+            if not client_algo_id.startswith(settings.ORDER_CLIENT_PREFIX):
+                continue
+            self.cancel_algo_order(algo_id=int(order["algoId"]))
+            cancelled += 1
+
         return cancelled
 
     def get_position(self, symbol: str) -> PositionState:
@@ -733,38 +816,36 @@ class BinanceDemoClient:
         self,
         symbol: str,
         position_side: str,
-        quantity: float,
         take_profit_price: float,
         stop_loss_price: float,
     ) -> None:
         close_side = ORDER_SIDE_SELL if position_side == POSITION_LONG else ORDER_SIDE_BUY
         timestamp_suffix = str(now_ms())
+        common_params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": close_side,
+            "positionSide": "BOTH",
+            "workingType": "CONTRACT_PRICE",
+            "closePosition": "true",
+            "priceProtect": "FALSE",
+        }
 
         tp_params = {
-            "symbol": symbol,
-            "side": close_side,
+            **common_params,
             "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": take_profit_price,
-            "quantity": quantity,
-            "reduceOnly": "true",
-            "workingType": "CONTRACT_PRICE",
-            "priceProtect": "false",
-            "newClientOrderId": f"{settings.ORDER_CLIENT_PREFIX}_tp_{timestamp_suffix}",
+            "triggerPrice": take_profit_price,
+            "clientAlgoId": f"{settings.ORDER_CLIENT_PREFIX}_tp_{timestamp_suffix}",
         }
         sl_params = {
-            "symbol": symbol,
-            "side": close_side,
+            **common_params,
             "type": "STOP_MARKET",
-            "stopPrice": stop_loss_price,
-            "quantity": quantity,
-            "reduceOnly": "true",
-            "workingType": "CONTRACT_PRICE",
-            "priceProtect": "false",
-            "newClientOrderId": f"{settings.ORDER_CLIENT_PREFIX}_sl_{timestamp_suffix}",
+            "triggerPrice": stop_loss_price,
+            "clientAlgoId": f"{settings.ORDER_CLIENT_PREFIX}_sl_{timestamp_suffix}",
         }
 
-        self._signed_request("POST", "/fapi/v1/order", tp_params)
-        self._signed_request("POST", "/fapi/v1/order", sl_params)
+        self._signed_request("POST", "/fapi/v1/algoOrder", tp_params)
+        self._signed_request("POST", "/fapi/v1/algoOrder", sl_params)
 
 
 class TradeBotController:
@@ -867,11 +948,18 @@ class TradeBotController:
     def housekeep_orders(self) -> None:
         position = self.demo_client.get_position(settings.SYMBOL)
         open_orders = self.demo_client.get_open_orders(settings.SYMBOL)
+        algo_orders = self.demo_client.get_open_algo_orders(settings.SYMBOL)
         bot_orders = [o for o in open_orders if str(o.get("clientOrderId", "")).startswith(settings.ORDER_CLIENT_PREFIX)]
+        bot_algo_orders = [o for o in algo_orders if str(o.get("clientAlgoId", "")).startswith(settings.ORDER_CLIENT_PREFIX)]
         if not position.is_open and bot_orders:
             for order in bot_orders:
                 self.demo_client.cancel_order(settings.SYMBOL, int(order["orderId"]))
-            self.logger(f"Pozisyon yokken kalan {len(bot_orders)} bot emri iptal edildi.")
+        if not position.is_open and bot_algo_orders:
+            for order in bot_algo_orders:
+                self.demo_client.cancel_algo_order(algo_id=int(order["algoId"]))
+        cancelled_total = len(bot_orders) + len(bot_algo_orders)
+        if not position.is_open and cancelled_total:
+            self.logger(f"Pozisyon yokken kalan {cancelled_total} bot emri iptal edildi.")
 
     def process_if_new_bar(self) -> bool:
         raw_frame = self.feature_assembler.build_live_feature_frame(settings.SYMBOL)
@@ -1025,7 +1113,6 @@ class TradeBotController:
         self.demo_client.place_protective_orders(
             symbol=settings.SYMBOL,
             position_side=position.side,
-            quantity=self.round_quantity(position.quantity),
             take_profit_price=tp_price,
             stop_loss_price=sl_price,
         )
@@ -1121,13 +1208,19 @@ class TradeBotController:
         return rounded
 
     def has_bot_protection_orders(self) -> bool:
-        orders = self.demo_client.get_open_orders(settings.SYMBOL)
+        regular_orders = self.demo_client.get_open_orders(settings.SYMBOL)
+        algo_orders = self.demo_client.get_open_algo_orders(settings.SYMBOL)
         bot_orders = [
             o
-            for o in orders
+            for o in regular_orders
             if str(o.get("clientOrderId", "")).startswith(settings.ORDER_CLIENT_PREFIX)
         ]
-        return len(bot_orders) >= 2
+        bot_algo_orders = [
+            o
+            for o in algo_orders
+            if str(o.get("clientAlgoId", "")).startswith(settings.ORDER_CLIENT_PREFIX)
+        ]
+        return (len(bot_orders) + len(bot_algo_orders)) >= 2
 
 
 @dataclass

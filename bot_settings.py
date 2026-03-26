@@ -17,7 +17,7 @@ LEVERAGE = int(os.getenv("BTC_BOT_LEVERAGE", "5"))
 
 # Market data uses mainnet public endpoints by default.
 PUBLIC_MARKET_DATA_URL = os.getenv("BTC_BOT_PUBLIC_MARKET_DATA_URL", "https://fapi.binance.com")
-BINANCE_DEMO_BASE_URL = os.getenv("BINANCE_DEMO_BASE_URL", "https://testnet.binancefuture.com")
+BINANCE_DEMO_BASE_URL = os.getenv("BINANCE_DEMO_BASE_URL", "https://demo-fapi.binance.com")
 
 # Runtime settings.
 POLL_INTERVAL_SECONDS = float(os.getenv("BTC_BOT_POLL_INTERVAL_SECONDS", "15"))
@@ -27,3 +27,6 @@ ERROR_RETRY_SECONDS = float(os.getenv("BTC_BOT_ERROR_RETRY_SECONDS", "10"))
 KLINE_HISTORY_BARS = int(os.getenv("BTC_BOT_KLINE_HISTORY_BARS", "3400"))
 ORDER_CLIENT_PREFIX = os.getenv("BTC_BOT_ORDER_PREFIX", "btcbot")
 RECV_WINDOW_MS = int(os.getenv("BTC_BOT_RECV_WINDOW_MS", "5000"))
+HTTP_TIMEOUT_SECONDS = float(os.getenv("BTC_BOT_HTTP_TIMEOUT_SECONDS", "20"))
+PUBLIC_API_MAX_RETRIES = int(os.getenv("BTC_BOT_PUBLIC_API_MAX_RETRIES", "2"))
+PUBLIC_API_RETRY_BACKOFF_SECONDS = float(os.getenv("BTC_BOT_PUBLIC_API_RETRY_BACKOFF_SECONDS", "1.5"))
