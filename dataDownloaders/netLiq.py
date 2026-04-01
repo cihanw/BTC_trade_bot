@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 
 import pandas as pd
 import requests
 
-API_KEY = "65fbb0f8ef9c5619a7d1f51c1ddf5e41"
+API_KEY = os.getenv("FRED_API_KEY", "")
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 # Fed Net Likidite = Fed Toplam Bilanco - (TGA + Ters Repo)
@@ -17,7 +18,7 @@ SERIES_IDS = {
 }
 
 START_DATE = "2020-01-01"
-END_DATE = "2026-03-01"
+END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "raw" / "netLiq"
 OUTPUT_CSV_PATH = OUTPUT_DIR / "fed_net_liquidity_1d.csv"
@@ -81,8 +82,8 @@ def build_net_liquidity() -> pd.DataFrame:
 
 
 def main() -> None:
-    if API_KEY == "x":
-        raise ValueError("API_KEY su an 'x'. Lutfen kendi FRED API key degerini gir.")
+    if not API_KEY:
+        raise ValueError("FRED_API_KEY environment variable is required.")
 
     df = build_net_liquidity()
 

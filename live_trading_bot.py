@@ -26,9 +26,7 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
 import bot_settings as settings
-from finalPreProcess import ATR_PERIOD, compute_effective_barrier_multiplier, compute_past_only_atr
-from preProcessx import load_and_fill_fed, load_fear_greed
-from preprocess3 import add_technical_indicators
+from live_model_runtime import ModelSignalEngine as MultiBranchModelSignalEngine
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -107,24 +105,17 @@ class EncoderOnlyTransformer(nn.Module):
 @dataclass(frozen=True)
 class RiskProfile:
     name: str
-    long_sell_threshold: float
-    short_buy_threshold: float
-    max_flat_probability: float | None
-    side_ratio_threshold: float | None
+    max_flat_probability: float
+    side_ratio_threshold: float
     flat_keeps_position: bool
     reverse_reopens_position: bool
     same_direction_scale_multiplier: float
     same_direction_grows_position: bool
 
     def derive_trade_label(self, p_buy: float, p_hold: float, p_sell: float) -> str:
-        if self.max_flat_probability is not None and self.side_ratio_threshold is not None:
-            long_mask = (p_hold <= self.max_flat_probability) and (p_buy > self.side_ratio_threshold * p_sell)
-            short_mask = (not long_mask) and (p_hold <= self.max_flat_probability) and (
-                p_sell > self.side_ratio_threshold * p_buy
-            )
-        else:
-            long_mask = (p_sell < self.long_sell_threshold) and (p_buy > p_hold)
-            short_mask = (not long_mask) and (p_buy < self.short_buy_threshold) and (p_sell > p_hold)
+        flat_gate = p_hold < self.max_flat_probability
+        long_mask = flat_gate and (p_buy > self.side_ratio_threshold * p_sell)
+        short_mask = flat_gate and (not long_mask) and (p_sell > self.side_ratio_threshold * p_buy)
 
         if long_mask:
             return "up"
@@ -136,10 +127,8 @@ class RiskProfile:
 RISK_PROFILES = {
     RISK_HIGH: RiskProfile(
         name=RISK_HIGH,
-        long_sell_threshold=0.34,
-        short_buy_threshold=0.34,
-        max_flat_probability=0.55,
-        side_ratio_threshold=2.0,
+        max_flat_probability=settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
+        side_ratio_threshold=settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
         flat_keeps_position=True,
         reverse_reopens_position=True,
         same_direction_scale_multiplier=1.5,
@@ -147,10 +136,8 @@ RISK_PROFILES = {
     ),
     RISK_LOW: RiskProfile(
         name=RISK_LOW,
-        long_sell_threshold=0.34,
-        short_buy_threshold=0.34,
-        max_flat_probability=None,
-        side_ratio_threshold=None,
+        max_flat_probability=settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
+        side_ratio_threshold=settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
         flat_keeps_position=False,
         reverse_reopens_position=False,
         same_direction_scale_multiplier=1.0,
@@ -851,13 +838,12 @@ class BinanceDemoClient:
 class TradeBotController:
     def __init__(
         self,
-        risk_name: str,
         logger: Callable[[str], None],
         api_key: str | None = None,
         api_secret: str | None = None,
+        databento_api_key: str | None = None,
         state_file: Path | None = None,
     ) -> None:
-        self.risk_profile = RISK_PROFILES[risk_name]
         self.logger = logger
         self.public_client = BinancePublicDataClient(settings.PUBLIC_MARKET_DATA_URL)
         self.demo_client = BinanceDemoClient(
@@ -865,13 +851,9 @@ class TradeBotController:
             api_secret=api_secret or settings.BINANCE_DEMO_API_SECRET,
             base_url=settings.BINANCE_DEMO_BASE_URL,
         )
-        self.signal_engine = ModelSignalEngine()
-        self.feature_assembler = LiveFeatureAssembler(
-            public_client=self.public_client,
-            history_bars=max(
-                settings.KLINE_HISTORY_BARS,
-                self.signal_engine.normalizer.rolling_window + self.signal_engine.normalizer.window_size + 64,
-            ),
+        self.signal_engine = MultiBranchModelSignalEngine(
+            databento_api_key=databento_api_key,
+            logger=logger,
         )
         self.symbol_rules = self.public_client.get_exchange_info(settings.SYMBOL)
         self.stop_event = threading.Event()
@@ -888,9 +870,11 @@ class TradeBotController:
         self.demo_client.ensure_one_way_mode()
         self.demo_client.set_leverage(settings.SYMBOL, settings.LEVERAGE)
         self.logger(
-            f"Bot basladi | risk={self.risk_profile.name} | symbol={settings.SYMBOL} | "
+            f"Bot basladi | symbol={settings.SYMBOL} | "
             f"risk_per_trade={settings.ACCOUNT_RISK_PER_TRADE * 100:.2f}% | "
-            f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x"
+            f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x | "
+            f"flat_gate<{self.signal_engine.decision_rule.max_flat_probability:.2f} | "
+            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f}"
         )
         self.run_loop()
 
@@ -899,9 +883,11 @@ class TradeBotController:
         self.demo_client.ensure_one_way_mode()
         self.demo_client.set_leverage(settings.SYMBOL, settings.LEVERAGE)
         self.logger(
-            f"Tek seferlik calisma basladi | risk={self.risk_profile.name} | symbol={settings.SYMBOL} | "
+            f"Tek seferlik calisma basladi | symbol={settings.SYMBOL} | "
             f"risk_per_trade={settings.ACCOUNT_RISK_PER_TRADE * 100:.2f}% | "
-            f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x"
+            f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x | "
+            f"flat_gate<{self.signal_engine.decision_rule.max_flat_probability:.2f} | "
+            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f}"
         )
         self.housekeep_orders()
         self.process_if_new_bar()
@@ -943,7 +929,13 @@ class TradeBotController:
             f"Sonraki {settings.BAR_INTERVAL_MINUTES}m mum kapanisi bekleniyor: "
             f"{next_close_time:%Y-%m-%d %H:%M}"
         )
-        return self.stop_event.wait(wait_seconds)
+        remaining = wait_seconds
+        while remaining > 0:
+            sleep_chunk = min(60.0, remaining)
+            if self.stop_event.wait(sleep_chunk):
+                return True
+            remaining -= sleep_chunk
+        return False
 
     def housekeep_orders(self) -> None:
         position = self.demo_client.get_position(settings.SYMBOL)
@@ -962,18 +954,12 @@ class TradeBotController:
             self.logger(f"Pozisyon yokken kalan {cancelled_total} bot emri iptal edildi.")
 
     def process_if_new_bar(self) -> bool:
-        raw_frame = self.feature_assembler.build_live_feature_frame(settings.SYMBOL)
-        raw_frame = raw_frame.dropna(subset=["barrier_width"]).reset_index(drop=True)
-        if raw_frame.empty:
-            raise ValueError("Canli feature frame bos dondu.")
-
-        snapshot = self.signal_engine.predict_latest(raw_frame)
-        label = self.risk_profile.derive_trade_label(
+        snapshot = self.signal_engine.predict_latest()
+        label = self.signal_engine.decision_rule.derive_trade_label(
             p_buy=snapshot.probs["p_up"],
             p_hold=snapshot.probs["p_flat"],
             p_sell=snapshot.probs["p_down"],
         )
-        snapshot.trade_label = label
 
         if self.last_processed_bar is not None and snapshot.bar_time <= self.last_processed_bar:
             return False
@@ -983,9 +969,12 @@ class TradeBotController:
         self.logger(
             f"{snapshot.bar_time:%Y-%m-%d %H:%M} kapandi | close={snapshot.close_price:.2f} | "
             f"p_up={snapshot.probs['p_up']:.4f} p_flat={snapshot.probs['p_flat']:.4f} "
-            f"p_down={snapshot.probs['p_down']:.4f} | signal={snapshot.trade_label}"
+            f"p_down={snapshot.probs['p_down']:.4f} | signal={label}"
         )
-        self.apply_trade_rules(snapshot)
+        if getattr(snapshot, "notes", None):
+            for note in snapshot.notes:
+                self.logger(f"Data note: {note}")
+        self.apply_trade_rules(snapshot, signal=label)
         return True
 
     def _load_last_processed_bar(self) -> pd.Timestamp | None:
@@ -1009,9 +998,8 @@ class TradeBotController:
         except Exception as exc:
             self.logger(f"State dosyasi yazilamadi: {exc}")
 
-    def apply_trade_rules(self, snapshot: SignalSnapshot) -> None:
+    def apply_trade_rules(self, snapshot: object, signal: str) -> None:
         position = self.demo_client.get_position(settings.SYMBOL)
-        signal = snapshot.trade_label
 
         if not position.is_open:
             if signal in {"up", "down"}:
@@ -1032,44 +1020,23 @@ class TradeBotController:
             return
 
         if signal == "flat":
-            if self.risk_profile.flat_keeps_position:
-                if not self.has_bot_protection_orders():
-                    self.place_or_refresh_protection(position, snapshot)
-                    self.logger("High risk flat sinyalinde koruma emirleri yeniden yazildi.")
-                else:
-                    self.logger("High risk flat sinyalinde pozisyon korunuyor.")
-                return
-
-            self.close_position(position, reason="Low risk flat sinyal")
+            self.close_position(position, reason="Notebook rule flat signal")
             return
 
         if opposite_direction:
             self.close_position(position, reason="Ters sinyal")
-            if self.risk_profile.reverse_reopens_position:
-                self.open_new_position(signal, snapshot)
-            else:
-                self.logger("Low risk modunda ters sinyal sonrasi yeni pozisyon acilmadi.")
+            self.open_new_position(signal, snapshot)
 
-    def handle_same_direction_signal(self, position: PositionState, snapshot: SignalSnapshot) -> None:
-        risk_notional, balance_state = self.compute_risk_based_notional(snapshot)
-        if self.risk_profile.same_direction_grows_position:
-            desired_notional = position.notional * self.risk_profile.same_direction_scale_multiplier
-            target_notional = min(desired_notional, risk_notional)
-            self.logger(
-                f"High risk ayni yon sinyali | desired_notional={desired_notional:.2f} | "
-                f"risk_cap={risk_notional:.2f} | equity={balance_state.equity:.2f}"
-            )
-        else:
-            target_notional = min(position.notional, risk_notional)
-            self.logger(
-                f"Low risk ayni yon sinyali | current_notional={position.notional:.2f} | "
-                f"risk_cap={risk_notional:.2f} | equity={balance_state.equity:.2f}"
-            )
-
+    def handle_same_direction_signal(self, position: PositionState, snapshot: object) -> None:
+        target_notional, balance_state = self.compute_risk_based_notional(snapshot)
+        self.logger(
+            f"Ayni yon sinyali | current_notional={position.notional:.2f} | "
+            f"target_notional={target_notional:.2f} | equity={balance_state.equity:.2f}"
+        )
         position = self.rebalance_position_to_target_notional(position, snapshot, target_notional)
         self.place_or_refresh_protection(position, snapshot)
 
-    def open_new_position(self, signal: str, snapshot: SignalSnapshot) -> None:
+    def open_new_position(self, signal: str, snapshot: object) -> None:
         side = ORDER_SIDE_BUY if signal == "up" else ORDER_SIDE_SELL
         target_notional, balance_state = self.compute_risk_based_notional(snapshot)
         quantity = self.quantity_for_notional(target_notional, snapshot.close_price)
@@ -1107,7 +1074,7 @@ class TradeBotController:
         self.logger(f"Pozisyon kapatildi | reason={reason}")
         time.sleep(1.0)
 
-    def place_or_refresh_protection(self, position: PositionState, snapshot: SignalSnapshot) -> None:
+    def place_or_refresh_protection(self, position: PositionState, snapshot: object) -> None:
         self.demo_client.cancel_bot_orders(settings.SYMBOL)
         tp_price, sl_price = self.compute_tp_sl_prices(position.side, snapshot.close_price, snapshot.barrier_width)
         self.demo_client.place_protective_orders(
@@ -1141,7 +1108,7 @@ class TradeBotController:
         adjusted_notional = max(notional_usdt, min_notional)
         return adjusted_notional / price
 
-    def compute_risk_based_notional(self, snapshot: SignalSnapshot) -> tuple[float, AccountBalanceState]:
+    def compute_risk_based_notional(self, snapshot: object) -> tuple[float, AccountBalanceState]:
         stop_distance = snapshot.barrier_width * settings.STOP_LOSS_FACTOR
         if not np.isfinite(stop_distance) or stop_distance <= 0:
             raise ValueError("Stop distance hesaplanamadi.")
@@ -1156,7 +1123,7 @@ class TradeBotController:
     def rebalance_position_to_target_notional(
         self,
         position: PositionState,
-        snapshot: SignalSnapshot,
+        snapshot: object,
         target_notional: float,
     ) -> PositionState:
         target_qty = self.quantity_for_notional(target_notional, snapshot.close_price)
@@ -1227,7 +1194,6 @@ class TradeBotController:
 class DashboardState:
     running: bool = False
     status: str = "Hazir"
-    risk: str = RISK_LOW
     logs: list[str] = field(default_factory=list)
     controller: TradeBotController | None = None
     worker_thread: threading.Thread | None = None
@@ -1247,39 +1213,53 @@ class BotDashboard:
             self.state.logs.append(line)
             self.state.logs = self.state.logs[-200:]
 
-    def start_bot(self, risk: str, api_key: str, api_secret: str) -> tuple[bool, str]:
+    def start_bot(
+        self,
+        api_key: str,
+        api_secret: str,
+        databento_api_key: str,
+    ) -> tuple[bool, str]:
         with self.lock:
             if self.state.worker_thread and self.state.worker_thread.is_alive():
                 return False, "Bot zaten calisiyor."
             self.state.status = "Baslatiliyor..."
-            self.state.risk = risk
             self.state.last_error = None
             worker = threading.Thread(
                 target=self._run_bot_thread,
-                args=(risk, api_key.strip(), api_secret.strip()),
+                args=(
+                    api_key.strip(),
+                    api_secret.strip(),
+                    databento_api_key.strip(),
+                ),
                 daemon=True,
             )
             self.state.worker_thread = worker
             worker.start()
         return True, "Bot baslatildi."
 
-    def _run_bot_thread(self, risk: str, api_key: str, api_secret: str) -> None:
+    def _run_bot_thread(
+        self,
+        api_key: str,
+        api_secret: str,
+        databento_api_key: str,
+    ) -> None:
         try:
             resolved_api_key = api_key or settings.BINANCE_DEMO_API_KEY
             resolved_api_secret = api_secret or settings.BINANCE_DEMO_API_SECRET
             if not resolved_api_key or not resolved_api_secret:
                 raise ValueError("Binance demo API key ve secret eksik. UI'dan gir veya `bot_settings.py` dosyasini doldur.")
 
+            resolved_databento_api_key = databento_api_key or settings.DATABENTO_API_KEY
             controller = TradeBotController(
-                risk_name=risk,
                 logger=self.log,
                 api_key=resolved_api_key,
                 api_secret=resolved_api_secret,
+                databento_api_key=resolved_databento_api_key,
             )
             with self.lock:
                 self.state.controller = controller
                 self.state.running = True
-                self.state.status = f"Calisiyor ({risk})"
+                self.state.status = "Calisiyor"
             controller.start()
         except Exception as exc:
             error_text = str(exc)
@@ -1310,7 +1290,6 @@ class BotDashboard:
             return {
                 "running": self.state.running,
                 "status": self.state.status,
-                "risk": self.state.risk,
                 "logs": list(self.state.logs),
                 "last_error": self.state.last_error,
                 "symbol": settings.SYMBOL,
@@ -1318,6 +1297,9 @@ class BotDashboard:
                 "risk_per_trade_pct": round(settings.ACCOUNT_RISK_PER_TRADE * 100.0, 4),
                 "stop_loss_factor": settings.STOP_LOSS_FACTOR,
                 "has_settings_keys": bool(settings.BINANCE_DEMO_API_KEY and settings.BINANCE_DEMO_API_SECRET),
+                "trade_rule_max_flat_prob": settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
+                "trade_rule_side_ratio": settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
+                "has_databento_config": bool(settings.DATABENTO_API_KEY),
             }
 
     def create_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -1358,14 +1340,10 @@ class BotDashboard:
                 payload = json.loads(raw_body.decode("utf-8") or "{}")
 
                 if self.path == "/api/start":
-                    risk = str(payload.get("risk", RISK_LOW)).lower()
-                    if risk not in RISK_PROFILES:
-                        self._send_json({"ok": False, "message": "Gecersiz risk degeri."}, status=HTTPStatus.BAD_REQUEST)
-                        return
                     ok, message = dashboard.start_bot(
-                        risk=risk,
                         api_key=str(payload.get("apiKey", "")),
                         api_secret=str(payload.get("apiSecret", "")),
+                        databento_api_key=str(payload.get("databentoApiKey", "")),
                     )
                     status = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
                     self._send_json({"ok": ok, "message": message}, status=status)
@@ -1381,21 +1359,19 @@ class BotDashboard:
 
         return DashboardHandler
 
-    def run(self, host: str = "127.0.0.1", port: int = 0, open_browser: bool = True) -> None:
-        if port == 0:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_socket:
-                temp_socket.bind((host, 0))
-                _, port = temp_socket.getsockname()
+    def run(self) -> None:
+        host = "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_socket:
+            temp_socket.bind((host, 0))
+            _, port = temp_socket.getsockname()
 
         server = ThreadingHTTPServer((host, port), self.create_handler())
-        public_host = "127.0.0.1" if host == "0.0.0.0" else host
-        url = f"http://{public_host}:{port}"
+        url = f"http://{host}:{port}"
         self.log(f"Dashboard hazir: {url}")
-        if open_browser:
-            try:
-                webbrowser.open(url)
-            except Exception:
-                self.log("Tarayici otomatik acilamadi; URL'yi manuel acabilirsin.")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            self.log("Tarayici otomatik acilamadi; URL'yi manuel acabilirsin.")
 
         try:
             server.serve_forever()
@@ -1444,7 +1420,7 @@ def build_dashboard_html() -> str:
       padding: 24px;
     }}
     .shell {{
-      width: min(960px, 100%);
+      width: min(980px, 100%);
       background: var(--panel);
       border: 1px solid rgba(255,255,255,0.65);
       border-radius: 28px;
@@ -1485,14 +1461,14 @@ def build_dashboard_html() -> str:
     }}
     .subtitle {{
       margin-top: 12px;
-      max-width: 620px;
+      max-width: 720px;
       color: var(--muted);
       font-size: 15px;
       line-height: 1.6;
     }}
     .grid {{
       display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: 1.08fr 0.92fr;
       gap: 18px;
       padding: 24px;
     }}
@@ -1518,7 +1494,7 @@ def build_dashboard_html() -> str:
       font-size: 13px;
       color: var(--muted);
     }}
-    input, select {{
+    input {{
       width: 100%;
       border: 1px solid rgba(27,27,27,0.12);
       background: rgba(255,255,255,0.8);
@@ -1528,7 +1504,7 @@ def build_dashboard_html() -> str:
       color: var(--ink);
       outline: none;
     }}
-    input:focus, select:focus {{
+    input:focus {{
       border-color: rgba(203,95,46,0.55);
       box-shadow: 0 0 0 4px rgba(203,95,46,0.12);
     }}
@@ -1602,7 +1578,7 @@ def build_dashboard_html() -> str:
     }}
     .stat .v {{
       margin-top: 8px;
-      font-size: 24px;
+      font-size: 22px;
       font-weight: 700;
       letter-spacing: -0.04em;
     }}
@@ -1612,13 +1588,23 @@ def build_dashboard_html() -> str:
       line-height: 1.6;
       color: var(--muted);
     }}
+    .banner {{
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(203,95,46,0.10);
+      border: 1px solid rgba(203,95,46,0.18);
+      color: var(--accent-dark);
+      font-size: 13px;
+      line-height: 1.6;
+    }}
     .logs {{
       margin: 0;
       padding: 0;
       list-style: none;
       display: grid;
       gap: 10px;
-      max-height: 360px;
+      max-height: 460px;
       overflow: auto;
     }}
     .logs li {{
@@ -1632,16 +1618,6 @@ def build_dashboard_html() -> str:
       white-space: pre-wrap;
       word-break: break-word;
     }}
-    .banner {{
-      margin-top: 14px;
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(203,95,46,0.10);
-      border: 1px solid rgba(203,95,46,0.18);
-      color: var(--accent-dark);
-      font-size: 13px;
-      line-height: 1.6;
-    }}
     @media (max-width: 860px) {{
       .grid {{
         grid-template-columns: 1fr;
@@ -1653,11 +1629,11 @@ def build_dashboard_html() -> str:
   <div class="shell">
     <section class="hero">
       <div class="eyebrow"><span class="dot"></span> BTC Demo Trade Bot</div>
-      <h1>Model orada. Karar burada.</h1>
+      <h1>Yeni model, tek karar kurali.</h1>
       <div class="subtitle">
-        Binance demo hesabina baglan, risk profilini sec ve botu buradan yonet.
-        Pozisyon boyutu stopta yaklasik %{settings.ACCOUNT_RISK_PER_TRADE * 100:.0f} hesap riski hedefler;
-        TP esik, SL ise esik x {settings.STOP_LOSS_FACTOR:.2f}.
+        Canli 30m veri akisi Coinbase, Binance, Bybit ve CME katmanlarini birlestirir.
+        CME verisi Databento uzerinden cekilir. Pozisyon boyutu her islemde
+        yaklasik %{settings.ACCOUNT_RISK_PER_TRADE * 100:.0f} hesap riski hedefler.
       </div>
     </section>
     <section class="grid">
@@ -1668,17 +1644,19 @@ def build_dashboard_html() -> str:
           <div class="stat"><div class="k">Symbol</div><div class="v">{settings.SYMBOL}</div></div>
           <div class="stat"><div class="k">Leverage</div><div class="v">{settings.LEVERAGE}x</div></div>
           <div class="stat"><div class="k">Risk / Trade</div><div class="v">%{settings.ACCOUNT_RISK_PER_TRADE * 100:.0f}</div></div>
-          <div class="stat"><div class="k">SL Factor</div><div class="v">{settings.STOP_LOSS_FACTOR:.2f}</div></div>
+          <div class="stat"><div class="k">Rule</div><div class="v">flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</div></div>
+        </div>
+        <div class="banner">
+          Giris mantigi notebook ile ayni:
+          <code>p_flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</code> ise,
+          <code>up &gt; {settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD:.2f} x down</code> long,
+          <code>down &gt; {settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD:.2f} x up</code> short,
+          aksi halde flat.
         </div>
         <div class="hint">
-          API anahtarlarini burada girebilirsin. Bos birakirsan bot once <code>bot_settings.py</code> icindeki degerleri dener.
-        </div>
-        <div class="field">
-          <label for="risk">Risk seviyesi</label>
-          <select id="risk">
-            <option value="low">Low</option>
-            <option value="high">High</option>
-          </select>
+          Binance demo anahtarlarini ve Databento API key bilgisini burada girebilirsin.
+          Databento keyi icin onerilen yol bu ekran; Binance alanlari bos birakilirsa
+          <code>bot_settings.py</code> degerleri kullanilir.
         </div>
         <div class="field">
           <label for="api-key">Binance Demo API Key</label>
@@ -1687,6 +1665,10 @@ def build_dashboard_html() -> str:
         <div class="field">
           <label for="api-secret">Binance Demo API Secret</label>
           <input id="api-secret" type="password" placeholder="UI'dan yapistir veya bot_settings.py kullan">
+        </div>
+        <div class="field">
+          <label for="databento-api-key">Databento API Key</label>
+          <input id="databento-api-key" type="password" placeholder="db-...">
         </div>
         <div class="actions">
           <button id="start-btn" class="primary">Botu Baslat</button>
@@ -1704,10 +1686,9 @@ def build_dashboard_html() -> str:
     const logsEl = document.getElementById('logs');
     const startBtn = document.getElementById('start-btn');
     const stopBtn = document.getElementById('stop-btn');
-    const riskEl = document.getElementById('risk');
     const apiKeyEl = document.getElementById('api-key');
     const apiSecretEl = document.getElementById('api-secret');
-    let riskDirty = false;
+    const databentoApiKeyEl = document.getElementById('databento-api-key');
 
     function setStatus(text, isWarn) {{
       statusPill.textContent = text;
@@ -1718,10 +1699,6 @@ def build_dashboard_html() -> str:
       const res = await fetch('/api/state');
       const state = await res.json();
       setStatus(state.status, Boolean(state.last_error));
-      if (state.running || !riskDirty) {{
-        riskEl.value = state.risk || 'low';
-        riskDirty = false;
-      }}
       startBtn.disabled = state.running;
       stopBtn.disabled = !state.running;
 
@@ -1734,10 +1711,6 @@ def build_dashboard_html() -> str:
       }}
     }}
 
-    riskEl.addEventListener('change', () => {{
-      riskDirty = true;
-    }});
-
     async function postJson(path, payload) {{
       const res = await fetch(path, {{
         method: 'POST',
@@ -1749,11 +1722,10 @@ def build_dashboard_html() -> str:
 
     startBtn.addEventListener('click', async () => {{
       startBtn.disabled = true;
-      riskDirty = false;
       const response = await postJson('/api/start', {{
-        risk: riskEl.value,
         apiKey: apiKeyEl.value,
-        apiSecret: apiSecretEl.value
+        apiSecret: apiSecretEl.value,
+        databentoApiKey: databentoApiKeyEl.value
       }});
       if (!response.ok) {{
         alert(response.message);
@@ -1778,20 +1750,9 @@ def build_dashboard_html() -> str:
 
 
 def run_smoke_test() -> None:
-    public_client = BinancePublicDataClient(settings.PUBLIC_MARKET_DATA_URL)
-    signal_engine = ModelSignalEngine()
-    assembler = LiveFeatureAssembler(
-        public_client=public_client,
-        history_bars=max(
-            settings.KLINE_HISTORY_BARS,
-            signal_engine.normalizer.rolling_window + signal_engine.normalizer.window_size + 64,
-        ),
-    )
-    raw_frame = assembler.build_live_feature_frame(settings.SYMBOL)
-    raw_frame = raw_frame.dropna(subset=["barrier_width"]).reset_index(drop=True)
-    snapshot = signal_engine.predict_latest(raw_frame)
-    risk_profile = RISK_PROFILES[RISK_LOW]
-    trade_label = risk_profile.derive_trade_label(
+    signal_engine = MultiBranchModelSignalEngine()
+    snapshot = signal_engine.predict_latest()
+    trade_label = signal_engine.decision_rule.derive_trade_label(
         p_buy=snapshot.probs["p_up"],
         p_hold=snapshot.probs["p_flat"],
         p_sell=snapshot.probs["p_down"],
@@ -1803,35 +1764,12 @@ def run_smoke_test() -> None:
         "Probabilities: "
         f"up={snapshot.probs['p_up']:.6f}, flat={snapshot.probs['p_flat']:.6f}, down={snapshot.probs['p_down']:.6f}"
     )
-    print(f"Low-risk label: {trade_label}")
-    print(f"Rows used: {len(raw_frame)}")
-
-
-def run_headless_bot(risk: str, api_key: str, api_secret: str) -> None:
-    resolved_api_key = api_key or settings.BINANCE_DEMO_API_KEY
-    resolved_api_secret = api_secret or settings.BINANCE_DEMO_API_SECRET
-    if not resolved_api_key or not resolved_api_secret:
-        raise ValueError("Headless mod icin Binance demo API key ve secret gerekli.")
-
-    def logger(message: str) -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        print(f"[{timestamp}] {message}", flush=True)
-
-    controller = TradeBotController(
-        risk_name=risk,
-        logger=logger,
-        api_key=resolved_api_key,
-        api_secret=resolved_api_secret,
-    )
-    try:
-        controller.start()
-    except KeyboardInterrupt:
-        logger("KeyboardInterrupt alindi, bot durduruluyor...")
-        controller.stop()
-        raise
-
-
-def run_once_bot(risk: str, api_key: str, api_secret: str, state_file: str) -> None:
+    print(f"Notebook rule label: {trade_label}")
+    if snapshot.notes:
+        print("Data notes:")
+        for note in snapshot.notes:
+            print(f"- {note}")
+def run_once_bot(api_key: str, api_secret: str, databento_api_key: str, state_file: str) -> None:
     resolved_api_key = api_key or settings.BINANCE_DEMO_API_KEY
     resolved_api_secret = api_secret or settings.BINANCE_DEMO_API_SECRET
     if not resolved_api_key or not resolved_api_secret:
@@ -1842,10 +1780,10 @@ def run_once_bot(risk: str, api_key: str, api_secret: str, state_file: str) -> N
         print(f"[{timestamp}] {message}", flush=True)
 
     controller = TradeBotController(
-        risk_name=risk,
         logger=logger,
         api_key=resolved_api_key,
         api_secret=resolved_api_secret,
+        databento_api_key=databento_api_key or settings.DATABENTO_API_KEY,
         state_file=Path(state_file),
     )
     controller.run_once()
@@ -1854,14 +1792,10 @@ def run_once_bot(risk: str, api_key: str, api_secret: str, state_file: str) -> N
 def main() -> None:
     parser = argparse.ArgumentParser(description="BTC Binance demo trade bot")
     parser.add_argument("--smoke-test", action="store_true", help="Load live features and print the latest prediction")
-    parser.add_argument("--headless", action="store_true", help="Run without the dashboard UI")
     parser.add_argument("--run-once", action="store_true", help="Process the latest closed candle once and exit")
-    parser.add_argument("--risk", choices=[RISK_LOW, RISK_HIGH], default=RISK_LOW, help="Risk profile for headless mode")
     parser.add_argument("--api-key", default="", help="Override Binance demo API key")
     parser.add_argument("--api-secret", default="", help="Override Binance demo API secret")
-    parser.add_argument("--host", default="127.0.0.1", help="Dashboard bind host")
-    parser.add_argument("--port", type=int, default=0, help="Dashboard bind port (0 picks a free port)")
-    parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the dashboard in a browser")
+    parser.add_argument("--databento-api-key", default="", help="Override Databento API key for live CME data")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help="State file used by --run-once")
     args = parser.parse_args()
 
@@ -1871,18 +1805,14 @@ def main() -> None:
 
     if args.run_once:
         run_once_bot(
-            risk=args.risk,
             api_key=args.api_key,
             api_secret=args.api_secret,
+            databento_api_key=args.databento_api_key,
             state_file=args.state_file,
         )
         return
 
-    if args.headless:
-        run_headless_bot(risk=args.risk, api_key=args.api_key, api_secret=args.api_secret)
-        return
-
-    BotDashboard().run(host=args.host, port=args.port, open_browser=not args.no_browser)
+    BotDashboard().run()
 
 
 if __name__ == "__main__":

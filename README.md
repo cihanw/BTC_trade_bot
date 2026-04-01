@@ -1,62 +1,50 @@
 # BTC Trade Bot
 
-A Python-based data collection and merging project. Binance Futures data and additional market metrics are collected and merged into a single processed dataset.
+Multi-source BTC market-data pipeline plus a local Binance demo trading bot driven by the trained dual-input model in `model/model.pt`.
 
-## Current Status
+## Repository Notes
 
-- Binance **30m Kline** data has been collected.
-- Binance **Funding Rate** data has been collected.
-- **Open Interest** and **Long/Short Ratio** data has been added.
-- **CME BTC Futures** data has been integrated into the project.
-- All sources were merged, and processed outputs were generated under `data/processed/`.
+- Large raw and processed datasets are intentionally **not versioned**.
+- Prepare the local datasets under `data/raw/` and `data/processed/` before running the notebooks or live bot.
+- `data/raw/README.md` is the only file kept under `data/` in git so the expected folder structure stays documented.
 
-## Project Structure
+## Main Components
 
-- `klines_fundingRate_30min.py`: Kline and funding rate download operations
-- `openInterest.py`: Open interest processing
-- `CME.py`: CME data fetching and saving
-- `preprocess1.py`, `preprocess2.py`, `preprocess3.py`: Data cleaning and merge steps
-- `data/raw/`: Raw data files
-- `data/processed/`: Merged/processed outputs
+- `dataDownloaders/`: source-specific downloaders for Binance, Coinbase, Bybit, Databento CME, Fear & Greed, net liquidity, and open interest.
+- `preprocess/`: preprocessing scripts that normalize each source and build merged 30m / 1d model tables.
+- `trainScript.ipynb`: training notebook for the current multi-timescale model.
+- `live_model_runtime.py`: rebuilds the latest model inputs from processed history plus live overlays.
+- `live_trading_bot.py`: local dashboard and Binance demo execution loop.
 
-## Usage
+## Data Pipeline
 
 1. Install dependencies:
    ```bash
-   pip install pandas requests
+   pip install -r requirements.txt
    ```
-2. Run data collection scripts:
-   ```bash
-   python klines_fundingRate_30min.py
-   python openInterest.py
-   python CME.py
-   ```
-3. Run preprocessing and merge steps:
-   ```bash
-   python preprocess1.py
-   python preprocess2.py
-   python preprocess3.py
-   ```
+2. Run the required downloaders in `dataDownloaders/` for the sources you want to refresh.
+3. Run the preprocessing scripts in `preprocess/` to rebuild the processed model inputs under `data/processed/`.
 
 ## Live Demo Bot
 
-- Edit `bot_settings.py` and place your Binance Global demo API key/secret there.
+- Edit `bot_settings.py` and place your Binance demo API key/secret there if you do not want to enter them from the UI.
+- For live CME input, provide a Databento API key from the UI or set `DATABENTO_API_KEY` in your environment.
 - Smoke test the live inference pipeline without sending orders:
   ```bash
-  python live_trading_bot.py --smoke-test
+  .venv\Scripts\python.exe live_trading_bot.py --smoke-test
   ```
-- Start the UI:
+- Start the local UI:
   ```bash
-  python live_trading_bot.py
+  .venv\Scripts\python.exe live_trading_bot.py
   ```
-- Run headless for 24/7 server usage:
+- Process only the latest closed candle once and exit:
   ```bash
-  python live_trading_bot.py --headless --risk low
+  .venv\Scripts\python.exe live_trading_bot.py --run-once
   ```
 
-Running `live_trading_bot.py` now starts a local browser dashboard. You can enter the Binance demo API key/secret directly in the page or leave them blank and use `bot_settings.py` as fallback. The bot rebuilds the training-time scaler from `data/processed/final.csv`, fetches the latest 30m Binance Futures data, derives the model decision, and applies the requested position-management rules on the Binance demo account.
+Running `live_trading_bot.py` now starts a local browser dashboard on `127.0.0.1`. You can enter the Binance demo API key/secret and Databento API key directly in the page or leave the Binance fields blank and use `bot_settings.py` as fallback. The bot loads the dual-input model from `model/model.pt`, rebuilds the latest feature windows, derives the notebook-aligned trade decision, and applies the position-management rules on the Binance demo account.
 
 Sizing and exits:
 - `TP` distance uses the model-driven threshold (`barrier_width`).
 - `SL` distance uses `barrier_width * 0.75`.
-- New positions are sized from account equity so that a stop-out targets roughly `3%` account loss, capped by the configured leverage.
+- New positions are sized from account equity so that a stop-out targets roughly `10%` account loss, capped by the configured leverage.
