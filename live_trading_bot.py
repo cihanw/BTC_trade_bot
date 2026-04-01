@@ -842,6 +842,8 @@ class TradeBotController:
         api_key: str | None = None,
         api_secret: str | None = None,
         databento_api_key: str | None = None,
+        fred_api_key: str | None = None,
+        coinalyze_api_key: str | None = None,
         state_file: Path | None = None,
     ) -> None:
         self.logger = logger
@@ -853,6 +855,8 @@ class TradeBotController:
         )
         self.signal_engine = MultiBranchModelSignalEngine(
             databento_api_key=databento_api_key,
+            fred_api_key=fred_api_key,
+            coinalyze_api_key=coinalyze_api_key,
             logger=logger,
         )
         self.symbol_rules = self.public_client.get_exchange_info(settings.SYMBOL)
@@ -1218,6 +1222,8 @@ class BotDashboard:
         api_key: str,
         api_secret: str,
         databento_api_key: str,
+        fred_api_key: str,
+        coinalyze_api_key: str,
     ) -> tuple[bool, str]:
         with self.lock:
             if self.state.worker_thread and self.state.worker_thread.is_alive():
@@ -1230,6 +1236,8 @@ class BotDashboard:
                     api_key.strip(),
                     api_secret.strip(),
                     databento_api_key.strip(),
+                    fred_api_key.strip(),
+                    coinalyze_api_key.strip(),
                 ),
                 daemon=True,
             )
@@ -1242,6 +1250,8 @@ class BotDashboard:
         api_key: str,
         api_secret: str,
         databento_api_key: str,
+        fred_api_key: str,
+        coinalyze_api_key: str,
     ) -> None:
         try:
             resolved_api_key = api_key or settings.BINANCE_DEMO_API_KEY
@@ -1250,11 +1260,15 @@ class BotDashboard:
                 raise ValueError("Binance demo API key ve secret eksik. UI'dan gir veya `bot_settings.py` dosyasini doldur.")
 
             resolved_databento_api_key = databento_api_key or settings.DATABENTO_API_KEY
+            resolved_fred_api_key = fred_api_key or settings.FRED_API_KEY
+            resolved_coinalyze_api_key = coinalyze_api_key or settings.COINALYZE_API_KEY
             controller = TradeBotController(
                 logger=self.log,
                 api_key=resolved_api_key,
                 api_secret=resolved_api_secret,
                 databento_api_key=resolved_databento_api_key,
+                fred_api_key=resolved_fred_api_key,
+                coinalyze_api_key=resolved_coinalyze_api_key,
             )
             with self.lock:
                 self.state.controller = controller
@@ -1300,6 +1314,8 @@ class BotDashboard:
                 "trade_rule_max_flat_prob": settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
                 "trade_rule_side_ratio": settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
                 "has_databento_config": bool(settings.DATABENTO_API_KEY),
+                "has_fred_config": bool(settings.FRED_API_KEY),
+                "has_coinalyze_config": bool(settings.COINALYZE_API_KEY),
             }
 
     def create_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -1344,6 +1360,8 @@ class BotDashboard:
                         api_key=str(payload.get("apiKey", "")),
                         api_secret=str(payload.get("apiSecret", "")),
                         databento_api_key=str(payload.get("databentoApiKey", "")),
+                        fred_api_key=str(payload.get("fredApiKey", "")),
+                        coinalyze_api_key=str(payload.get("coinalyzeApiKey", "")),
                     )
                     status = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
                     self._send_json({"ok": ok, "message": message}, status=status)
@@ -1654,9 +1672,10 @@ def build_dashboard_html() -> str:
           aksi halde flat.
         </div>
         <div class="hint">
-          Binance demo anahtarlarini ve Databento API key bilgisini burada girebilirsin.
-          Databento keyi icin onerilen yol bu ekran; Binance alanlari bos birakilirsa
-          <code>bot_settings.py</code> degerleri kullanilir.
+          Binance demo anahtarlarini ve canli feature key'lerini burada girebilirsin.
+          Ilk acilista bot gerekli gecmis veriyi API'lerden bootstrap eder, sonra sadece
+          son guncel barlari yeniler. Alanlar bos birakilirsa <code>bot_settings.py</code>
+          veya environment degerleri kullanilir.
         </div>
         <div class="field">
           <label for="api-key">Binance Demo API Key</label>
@@ -1669,6 +1688,14 @@ def build_dashboard_html() -> str:
         <div class="field">
           <label for="databento-api-key">Databento API Key</label>
           <input id="databento-api-key" type="password" placeholder="db-...">
+        </div>
+        <div class="field">
+          <label for="fred-api-key">FRED API Key</label>
+          <input id="fred-api-key" type="password" placeholder="FRED daily likidite key">
+        </div>
+        <div class="field">
+          <label for="coinalyze-api-key">Coinalyze API Key</label>
+          <input id="coinalyze-api-key" type="password" placeholder="Coinalyze daily OI / LSR key">
         </div>
         <div class="actions">
           <button id="start-btn" class="primary">Botu Baslat</button>
@@ -1689,6 +1716,8 @@ def build_dashboard_html() -> str:
     const apiKeyEl = document.getElementById('api-key');
     const apiSecretEl = document.getElementById('api-secret');
     const databentoApiKeyEl = document.getElementById('databento-api-key');
+    const fredApiKeyEl = document.getElementById('fred-api-key');
+    const coinalyzeApiKeyEl = document.getElementById('coinalyze-api-key');
 
     function setStatus(text, isWarn) {{
       statusPill.textContent = text;
@@ -1725,7 +1754,9 @@ def build_dashboard_html() -> str:
       const response = await postJson('/api/start', {{
         apiKey: apiKeyEl.value,
         apiSecret: apiSecretEl.value,
-        databentoApiKey: databentoApiKeyEl.value
+        databentoApiKey: databentoApiKeyEl.value,
+        fredApiKey: fredApiKeyEl.value,
+        coinalyzeApiKey: coinalyzeApiKeyEl.value
       }});
       if (!response.ok) {{
         alert(response.message);
@@ -1749,8 +1780,12 @@ def build_dashboard_html() -> str:
 </html>"""
 
 
-def run_smoke_test() -> None:
-    signal_engine = MultiBranchModelSignalEngine()
+def run_smoke_test(databento_api_key: str, fred_api_key: str, coinalyze_api_key: str) -> None:
+    signal_engine = MultiBranchModelSignalEngine(
+        databento_api_key=databento_api_key or settings.DATABENTO_API_KEY,
+        fred_api_key=fred_api_key or settings.FRED_API_KEY,
+        coinalyze_api_key=coinalyze_api_key or settings.COINALYZE_API_KEY,
+    )
     snapshot = signal_engine.predict_latest()
     trade_label = signal_engine.decision_rule.derive_trade_label(
         p_buy=snapshot.probs["p_up"],
@@ -1769,7 +1804,14 @@ def run_smoke_test() -> None:
         print("Data notes:")
         for note in snapshot.notes:
             print(f"- {note}")
-def run_once_bot(api_key: str, api_secret: str, databento_api_key: str, state_file: str) -> None:
+def run_once_bot(
+    api_key: str,
+    api_secret: str,
+    databento_api_key: str,
+    fred_api_key: str,
+    coinalyze_api_key: str,
+    state_file: str,
+) -> None:
     resolved_api_key = api_key or settings.BINANCE_DEMO_API_KEY
     resolved_api_secret = api_secret or settings.BINANCE_DEMO_API_SECRET
     if not resolved_api_key or not resolved_api_secret:
@@ -1784,6 +1826,8 @@ def run_once_bot(api_key: str, api_secret: str, databento_api_key: str, state_fi
         api_key=resolved_api_key,
         api_secret=resolved_api_secret,
         databento_api_key=databento_api_key or settings.DATABENTO_API_KEY,
+        fred_api_key=fred_api_key or settings.FRED_API_KEY,
+        coinalyze_api_key=coinalyze_api_key or settings.COINALYZE_API_KEY,
         state_file=Path(state_file),
     )
     controller.run_once()
@@ -1796,11 +1840,17 @@ def main() -> None:
     parser.add_argument("--api-key", default="", help="Override Binance demo API key")
     parser.add_argument("--api-secret", default="", help="Override Binance demo API secret")
     parser.add_argument("--databento-api-key", default="", help="Override Databento API key for live CME data")
+    parser.add_argument("--fred-api-key", default="", help="Override FRED API key for daily net-liquidity data")
+    parser.add_argument("--coinalyze-api-key", default="", help="Override Coinalyze API key for daily OI / LSR data")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help="State file used by --run-once")
     args = parser.parse_args()
 
     if args.smoke_test:
-        run_smoke_test()
+        run_smoke_test(
+            databento_api_key=args.databento_api_key,
+            fred_api_key=args.fred_api_key,
+            coinalyze_api_key=args.coinalyze_api_key,
+        )
         return
 
     if args.run_once:
@@ -1808,6 +1858,8 @@ def main() -> None:
             api_key=args.api_key,
             api_secret=args.api_secret,
             databento_api_key=args.databento_api_key,
+            fred_api_key=args.fred_api_key,
+            coinalyze_api_key=args.coinalyze_api_key,
             state_file=args.state_file,
         )
         return

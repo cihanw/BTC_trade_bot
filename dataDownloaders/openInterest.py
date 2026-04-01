@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 
-API_KEY = ("0c10ac4d-666c-4c6a-afc5-7e9de154c4dc")
+API_KEY = os.getenv("COINALYZE_API_KEY", "")
 BASE_URL = "https://api.coinalyze.net/v1"
 HEADERS = {"api_key": API_KEY}
 
