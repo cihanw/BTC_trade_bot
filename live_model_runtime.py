@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import time
+from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import databento as db
+import databento_dbn as dbn
 import numpy as np
 import pandas as pd
 import requests
@@ -33,9 +37,21 @@ LIVE_CME_PATH = LIVE_DATA_DIR / "cme_processed.csv"
 THIRTY_MINUTES = pd.Timedelta(minutes=30)
 ONE_DAY = pd.Timedelta(days=1)
 EIGHT_HOURS_MS = 8 * 60 * 60 * 1000
+LIVE_REPLAY_LOOKBACK = pd.Timedelta(hours=24)
 THIRTY_MINUTES_MS = int(THIRTY_MINUTES.total_seconds() * 1000)
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 COINALYZE_BASE_URL = "https://api.coinalyze.net/v1"
+US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+US_MARKET_CLOSE_HOUR = 16
+US_MARKET_CLOSE_MINUTE = 5
+CME_INCREMENTAL_FETCH_OVERLAP_BARS = 4
+CME_INCREMENTAL_CACHE_WARMUP_BARS = 96
+CME_SPECIAL_LAST_BAR_OPEN_UTC: dict[date, pd.Timestamp] = {
+    date(2026, 4, 3): pd.Timestamp("2026-04-03 15:00:00"),
+}
+CME_SPECIAL_SESSION_REASON_BY_DATE: dict[date, str] = {
+    date(2026, 4, 3): "CME Good Friday 2026 ozel kapanisi",
+}
 FRED_SERIES_IDS = {
     "fed_total_assets": "WALCL",
     "tga": "WTREGEN",
@@ -47,15 +63,19 @@ FRED_SERIES_IDS = {
 class DecisionRule:
     max_flat_probability: float
     side_ratio_threshold: float
+    ordering_max_flat_probability: float
 
     def derive_trade_label(self, p_buy: float, p_hold: float, p_sell: float) -> str:
         flat_gate = p_hold < self.max_flat_probability
         long_mask = flat_gate and (p_buy > self.side_ratio_threshold * p_sell)
         short_mask = flat_gate and (not long_mask) and (p_sell > self.side_ratio_threshold * p_buy)
+        ordering_gate = p_hold < self.ordering_max_flat_probability
+        ordering_long_mask = ordering_gate and (p_buy > p_hold > p_sell)
+        ordering_short_mask = ordering_gate and (p_sell > p_hold > p_buy)
 
-        if long_mask:
+        if long_mask or ordering_long_mask:
             return "up"
-        if short_mask:
+        if short_mask or ordering_short_mask:
             return "down"
         return "flat"
 
@@ -67,6 +87,23 @@ class PredictionResult:
     barrier_width: float
     probs: dict[str, float]
     notes: tuple[str, ...]
+
+
+class LatestBarPendingError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        expected_latest: pd.Timestamp | None = None,
+        latest_available: pd.Timestamp | None = None,
+        lagging_sources: tuple[str, ...] = (),
+        notes: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.expected_latest = expected_latest
+        self.latest_available = latest_available
+        self.lagging_sources = lagging_sources
+        self.notes = notes
 
 
 class EncoderOnlyTransformerBranch(nn.Module):
@@ -312,6 +349,17 @@ def _overlay_processed_frames(base_df: pd.DataFrame, live_df: pd.DataFrame) -> p
     return combined
 
 
+def _merge_time_frames(*frames: pd.DataFrame) -> pd.DataFrame:
+    non_empty = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not non_empty:
+        return pd.DataFrame()
+    merged = pd.concat(non_empty, ignore_index=True, sort=False)
+    if "time" in merged.columns:
+        merged["time"] = _parse_utc_naive(merged["time"])
+        merged = merged.dropna(subset=["time"]).sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+    return merged
+
+
 def _align_cvd_with_base(base_df: pd.DataFrame, live_df: pd.DataFrame, cvd_column: str, time_column: str = "time") -> pd.DataFrame:
     if live_df.empty or cvd_column not in live_df.columns or time_column not in live_df.columns:
         return live_df
@@ -345,6 +393,93 @@ def _latest_closed_30m_open_time(now_utc: pd.Timestamp | None = None) -> pd.Time
     return current_open - THIRTY_MINUTES
 
 
+def _cme_special_last_bar_open_utc(bar_open_utc: pd.Timestamp | str) -> pd.Timestamp | None:
+    normalized = _utc_naive(bar_open_utc)
+    return CME_SPECIAL_LAST_BAR_OPEN_UTC.get(normalized.date())
+
+
+def _cme_special_session_reason(bar_open_utc: pd.Timestamp | str) -> str | None:
+    normalized = _utc_naive(bar_open_utc)
+    special_last_bar = _cme_special_last_bar_open_utc(normalized)
+    if special_last_bar is None or normalized < special_last_bar:
+        return None
+    return CME_SPECIAL_SESSION_REASON_BY_DATE.get(normalized.date())
+
+
+def _is_cme_bitcoin_trading_open_time(bar_open_utc: pd.Timestamp) -> bool:
+    normalized = _utc_naive(bar_open_utc)
+    special_last_bar = _cme_special_last_bar_open_utc(normalized)
+    if special_last_bar is not None and normalized > special_last_bar:
+        return False
+
+    market_time = normalized.tz_localize("UTC").tz_convert(US_MARKET_TIMEZONE)
+    weekday = market_time.weekday()
+    hour = market_time.hour
+
+    if weekday == 5:
+        return False
+    if weekday == 4 and hour >= 17:
+        return False
+    if weekday == 6 and hour < 18:
+        return False
+    if weekday in {0, 1, 2, 3} and hour == 17:
+        return False
+    return True
+
+
+def _latest_closed_cme_30m_open_time(now_utc: pd.Timestamp | None = None) -> pd.Timestamp:
+    candidate = _latest_closed_30m_open_time(now_utc)
+    while not _is_cme_bitcoin_trading_open_time(candidate):
+        candidate -= THIRTY_MINUTES
+    return candidate
+
+
+def _latest_closed_30m_fetch_end(source_label: str, now_utc: pd.Timestamp | None = None) -> pd.Timestamp:
+    latest_open = _latest_closed_cme_30m_open_time(now_utc) if source_label == "Databento CME" else _latest_closed_30m_open_time(now_utc)
+    return latest_open + THIRTY_MINUTES
+
+
+def _latest_expected_common_30m_open_time(now_utc: pd.Timestamp | None = None) -> pd.Timestamp:
+    return min(_latest_closed_30m_open_time(now_utc), _latest_closed_cme_30m_open_time(now_utc))
+
+
+def _synthesize_missing_cme_rows(
+    cme_df: pd.DataFrame,
+    target_times: pd.Series | pd.Index | list[pd.Timestamp],
+) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    if cme_df.empty:
+        return cme_df.copy(), []
+
+    target_series = target_times if isinstance(target_times, pd.Series) else pd.Series(list(target_times), dtype="object")
+    target_index = pd.Index(_parse_utc_naive(target_series).dropna().drop_duplicates().sort_values())
+    if target_index.empty:
+        return _standardize_source_frame(cme_df.copy(), time_column="time"), []
+
+    cme = _standardize_source_frame(cme_df.copy(), time_column="time").set_index("time")
+    aligned = cme.reindex(target_index)
+    observed_mask = aligned.notna().any(axis=1)
+    has_prior_row = observed_mask.cummax()
+    synthetic_index = aligned.index[(~observed_mask) & has_prior_row]
+
+    filled = aligned.ffill().loc[has_prior_row].copy()
+    if len(synthetic_index) > 0:
+        if "CME_volume" in filled.columns:
+            filled.loc[synthetic_index, "CME_volume"] = 0.0
+        if "CME_count" in filled.columns:
+            filled.loc[synthetic_index, "CME_count"] = 0
+        if "CME_delta" in filled.columns:
+            filled.loc[synthetic_index, "CME_delta"] = 0
+        if "CME_open_time" in filled.columns:
+            filled.loc[synthetic_index, "CME_open_time"] = [int(pd.Timestamp(ts).timestamp()) for ts in synthetic_index]
+
+    out = filled.rename_axis("time").reset_index()
+    if "CME_count" in out.columns:
+        out["CME_count"] = pd.to_numeric(out["CME_count"], errors="coerce").fillna(0).round().astype("int64")
+    if "CME_open_time" in out.columns:
+        out["CME_open_time"] = pd.to_numeric(out["CME_open_time"], errors="coerce").fillna(0).astype("int64")
+    return _standardize_source_frame(out, time_column="time"), [pd.Timestamp(ts) for ts in synthetic_index]
+
+
 def _utc_naive(ts: pd.Timestamp | str) -> pd.Timestamp:
     parsed = pd.Timestamp(ts)
     if parsed.tzinfo is None:
@@ -363,6 +498,14 @@ def _trim_time_window(df: pd.DataFrame, start_time: pd.Timestamp) -> pd.DataFram
     out = df.copy()
     out["time"] = _parse_utc_naive(out["time"])
     return out.loc[out["time"] >= _utc_naive(start_time)].sort_values("time").reset_index(drop=True)
+
+
+def _has_large_30m_gap(df: pd.DataFrame, time_column: str = "time") -> bool:
+    if df.empty or time_column not in df.columns:
+        return False
+    times = _parse_utc_naive(df[time_column]).sort_values().reset_index(drop=True)
+    max_gap = times.diff().max()
+    return pd.notna(max_gap) and max_gap > (THIRTY_MINUTES + pd.Timedelta(minutes=1))
 
 
 def _trim_daily_window(df: pd.DataFrame, start_date: pd.Timestamp) -> pd.DataFrame:
@@ -461,6 +604,8 @@ def _reindex_and_ffill_daily(df: pd.DataFrame, start: pd.Timestamp, end: pd.Time
 
 
 class RetryHttpClient:
+    RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
     def __init__(self, timeout_seconds: float, max_retries: int, backoff_seconds: float, verify_ssl: bool = True) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
@@ -495,11 +640,16 @@ class RetryHttpClient:
                     raise RuntimeError(f"HTTP GET failed after {attempt} attempts | url={url} | reason={exc}") from exc
                 time.sleep(self.backoff_seconds * attempt)
             except requests.HTTPError as exc:
+                status_code = response.status_code if response is not None else None
+                if status_code in self.RETRYABLE_STATUS_CODES and attempt < attempts:
+                    time.sleep(self.backoff_seconds * attempt)
+                    continue
                 body = ""
                 if response is not None:
                     body = response.text[:400].strip()
                 raise RuntimeError(
-                    f"HTTP GET failed | url={url} | status={(response.status_code if response is not None else 'unknown')} | body={body}"
+                    f"HTTP GET failed | url={(response.url if response is not None else url)} | "
+                    f"status={(status_code if status_code is not None else 'unknown')} | body={body}"
                 ) from exc
 
         raise RuntimeError(f"HTTP GET exhausted retries unexpectedly | url={url}")
@@ -552,8 +702,6 @@ class BinanceLiveDataClient:
             if next_cursor <= cursor_ms:
                 break
             cursor_ms = next_cursor
-            if len(payload) < self.MAX_KLINE_LIMIT:
-                break
 
         if not rows:
             return pd.DataFrame()
@@ -900,11 +1048,11 @@ class DatabentoCmeClient:
         self.symbol = settings.DATABENTO_CME_SYMBOL
         self.stype_in = settings.DATABENTO_CME_STYPE_IN
         self.lookback_hours = max(float(settings.DATABENTO_CME_LOOKBACK_HOURS), 1.0)
-        self.client = db.Historical(self.api_key) if self.api_key else None
+        self.historical_client = db.Historical(self.api_key) if self.api_key else None
 
     @property
     def configured(self) -> bool:
-        return bool(self.api_key and self.client is not None)
+        return bool(self.api_key)
 
     @staticmethod
     def _ensure_ts_event_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -917,21 +1065,199 @@ class DatabentoCmeClient:
                 out = out.rename(columns={out.columns[0]: "ts_event"})
         return out
 
-    def _get_range(self, schema: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        if self.client is None:
-            return pd.DataFrame()
-        store = self.client.timeseries.get_range(
-            dataset=self.dataset,
-            start=_utc_naive(start).tz_localize("UTC"),
-            end=_utc_naive(end).tz_localize("UTC"),
-            symbols=[self.symbol],
-            schema=schema,
-            stype_in=self.stype_in,
+    @staticmethod
+    def _extract_cached_warmup_frames(base_df: pd.DataFrame, start_time: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if base_df is None or base_df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        cached = base_df.copy()
+        cached["time"] = _parse_utc_naive(cached["time"])
+        cached = cached.dropna(subset=["time"])
+        cached = cached[cached["time"] >= _utc_naive(start_time)].sort_values("time").reset_index(drop=True)
+        if cached.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        bars = cached[
+            ["time", "CME_open", "CME_high", "CME_low", "CME_close", "CME_volume"]
+        ].rename(
+            columns={
+                "CME_open": "open",
+                "CME_high": "high",
+                "CME_low": "low",
+                "CME_close": "close",
+                "CME_volume": "volume",
+            }
         )
-        return store.to_df(schema=schema, pretty_ts=True, map_symbols=False)
+        trades = cached[["time", "CME_count", "CME_delta"]].rename(
+            columns={
+                "CME_count": "count",
+                "CME_delta": "delta",
+            }
+        )
+        return bars.reset_index(drop=True), trades.reset_index(drop=True)
+
+    @staticmethod
+    def _parse_available_end_from_error(exc: Exception) -> pd.Timestamp | None:
+        match = re.search(r"available up to '([^']+)'", str(exc))
+        if match is None:
+            return None
+        parsed = pd.Timestamp(match.group(1))
+        if parsed.tzinfo is None:
+            parsed = parsed.tz_localize("UTC")
+        else:
+            parsed = parsed.tz_convert("UTC")
+        return parsed.tz_convert(None)
+
+    def _get_range_historical(self, schema: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        if self.historical_client is None:
+            return pd.DataFrame()
+        request_start = _utc_naive(start)
+        request_end = _utc_naive(end)
+        if request_end <= request_start:
+            return pd.DataFrame()
+
+        while True:
+            try:
+                store = self.historical_client.timeseries.get_range(
+                    dataset=self.dataset,
+                    start=request_start.tz_localize("UTC"),
+                    end=request_end.tz_localize("UTC"),
+                    symbols=[self.symbol],
+                    schema=schema,
+                    stype_in=self.stype_in,
+                )
+                return store.to_df(schema=schema, pretty_ts=True, map_symbols=False)
+            except Exception as exc:
+                available_end = self._parse_available_end_from_error(exc)
+                if available_end is None:
+                    raise
+                adjusted_end = min(request_end, available_end)
+                if adjusted_end >= request_end:
+                    adjusted_end = request_end - pd.Timedelta(minutes=1)
+                if adjusted_end <= request_start:
+                    raise
+                request_end = adjusted_end
+
+    def _live_replay_start(self, start: pd.Timestamp) -> pd.Timestamp:
+        now_utc = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        return max(_utc_naive(start), now_utc - LIVE_REPLAY_LOOKBACK)
+
+    def _get_range_live(self, schema: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        if not self.configured:
+            return pd.DataFrame()
+
+        replay_start = self._live_replay_start(start)
+        replay_end = _utc_naive(end)
+        if replay_end <= replay_start:
+            return pd.DataFrame()
+
+        client = db.Live(
+            self.api_key,
+            heartbeat_interval_s=5,
+            reconnect_policy="none",
+        )
+        rows: list[dict[str, object]] = []
+        replay_completed = False
+        range_completed = False
+        replay_start_utc = replay_start.tz_localize("UTC")
+        replay_end_utc = replay_end.tz_localize("UTC")
+        callback_error: Exception | None = None
+
+        def on_record(record: object) -> None:
+            nonlocal replay_completed, range_completed, callback_error
+            if callback_error is not None:
+                return
+
+            if isinstance(record, dbn.ErrorMsg):
+                callback_error = RuntimeError(f"Databento live error {record.code}: {record.err}")
+                client.terminate()
+                return
+
+            if isinstance(record, dbn.SystemMsg):
+                if getattr(record, "is_heartbeat", lambda: False)():
+                    return
+                if record.code == dbn.SystemCode.REPLAY_COMPLETED:
+                    replay_completed = True
+                    client.stop()
+                return
+
+            is_target_record = (
+                (schema == "ohlcv-1m" and isinstance(record, dbn.OHLCVMsg))
+                or (schema == "trades" and isinstance(record, dbn.TradeMsg))
+            )
+            if not is_target_record:
+                return
+
+            ts_event = pd.to_datetime(getattr(record, "ts_event", None), unit="ns", utc=True, errors="coerce")
+            if pd.isna(ts_event):
+                return
+            if ts_event < replay_start_utc:
+                return
+            if ts_event > replay_end_utc:
+                range_completed = True
+                client.stop()
+                return
+
+            if schema == "ohlcv-1m" and isinstance(record, dbn.OHLCVMsg):
+                rows.append(
+                    {
+                        "ts_event": ts_event,
+                        "open": float(record.pretty_open),
+                        "high": float(record.pretty_high),
+                        "low": float(record.pretty_low),
+                        "close": float(record.pretty_close),
+                        "volume": float(record.volume),
+                    }
+                )
+            elif schema == "trades" and isinstance(record, dbn.TradeMsg):
+                side = getattr(record.side, "value", record.side)
+                rows.append(
+                    {
+                        "ts_event": ts_event,
+                        "size": float(record.size),
+                        "side": str(side).upper(),
+                    }
+                )
+
+        def on_callback_exception(exc: Exception) -> None:
+            nonlocal callback_error
+            callback_error = exc
+            try:
+                client.terminate()
+            except Exception:
+                pass
+
+        client.add_callback(on_record, on_callback_exception)
+        client.subscribe(
+            dataset=self.dataset,
+            schema=schema,
+            symbols=[self.symbol],
+            stype_in=self.stype_in,
+            start=replay_start.tz_localize("UTC"),
+        )
+
+        try:
+            client.start()
+            client.block_for_close(timeout=max(settings.HTTP_TIMEOUT_SECONDS, 20.0))
+            if callback_error is not None:
+                raise callback_error
+        finally:
+            try:
+                client.terminate()
+            except Exception:
+                pass
+
+        if not replay_completed and not range_completed:
+            raise TimeoutError(f"Databento live replay timeout for schema={schema}")
+
+        if not rows:
+            if replay_completed or range_completed:
+                return pd.DataFrame()
+
+        return pd.DataFrame(rows)
 
     def _fetch_ohlcv_30m(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        ohlcv_df = self._ensure_ts_event_column(self._get_range("ohlcv-1m", start=start, end=end))
+        ohlcv_df = self._ensure_ts_event_column(self._get_range_historical("ohlcv-1m", start=start, end=end))
         if ohlcv_df.empty:
             return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
 
@@ -961,8 +1287,39 @@ class DatabentoCmeClient:
         )
         return aggregated.dropna(subset=["time", "open", "high", "low", "close"]).reset_index(drop=True)
 
+    def _fetch_ohlcv_30m_live(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        ohlcv_df = self._ensure_ts_event_column(self._get_range_live("ohlcv-1m", start=start, end=end))
+        if ohlcv_df.empty:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+        required_columns = {"ts_event", "open", "high", "low", "close", "volume"}
+        if not required_columns.issubset(ohlcv_df.columns):
+            missing = sorted(required_columns - set(ohlcv_df.columns))
+            raise RuntimeError(f"Databento CME live OHLCV response is missing expected columns: {missing}")
+
+        ohlcv_df["ts_event"] = pd.to_datetime(ohlcv_df["ts_event"], errors="coerce", utc=True)
+        for column in ["open", "high", "low", "close", "volume"]:
+            ohlcv_df[column] = pd.to_numeric(ohlcv_df[column], errors="coerce")
+        ohlcv_df = ohlcv_df.dropna(subset=["ts_event", "open", "high", "low", "close"]).copy()
+        if ohlcv_df.empty:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+        ohlcv_df["time"] = ohlcv_df["ts_event"].dt.tz_convert(None).dt.floor("1min")
+        aggregated = (
+            ohlcv_df.sort_values("time")
+            .groupby(pd.Grouper(key="time", freq="30min"), as_index=False)
+            .agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+            )
+        )
+        return aggregated.dropna(subset=["time", "open", "high", "low", "close"]).reset_index(drop=True)
+
     def _fetch_trade_metrics_30m(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        trades_df = self._ensure_ts_event_column(self._get_range("trades", start=start, end=end))
+        trades_df = self._ensure_ts_event_column(self._get_range_historical("trades", start=start, end=end))
         if trades_df.empty:
             return pd.DataFrame(columns=["time", "count", "delta"])
 
@@ -970,6 +1327,38 @@ class DatabentoCmeClient:
         if not required_columns.issubset(trades_df.columns):
             missing = sorted(required_columns - set(trades_df.columns))
             raise RuntimeError(f"Databento CME trades response is missing expected columns: {missing}")
+
+        trades_df = trades_df[["ts_event", "size", "side"]].copy()
+        trades_df["ts_event"] = pd.to_datetime(trades_df["ts_event"], errors="coerce", utc=True)
+        trades_df["size"] = pd.to_numeric(trades_df["size"], errors="coerce")
+        trades_df["side"] = trades_df["side"].astype("string").str.upper()
+        trades_df = trades_df.dropna(subset=["ts_event", "size"]).copy()
+        if trades_df.empty:
+            return pd.DataFrame(columns=["time", "count", "delta"])
+
+        trades_df["time"] = trades_df["ts_event"].dt.tz_convert(None).dt.floor("30min")
+        trades_df["signed_size"] = np.select(
+            [trades_df["side"] == "B", trades_df["side"] == "A"],
+            [trades_df["size"], -trades_df["size"]],
+            default=0.0,
+        )
+        aggregated = trades_df.groupby("time", as_index=False).agg(
+            count=("size", "count"),
+            delta=("signed_size", "sum"),
+        )
+        aggregated["count"] = aggregated["count"].round().astype("int64")
+        aggregated["delta"] = aggregated["delta"].round().astype("int64")
+        return aggregated
+
+    def _fetch_trade_metrics_30m_live(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        trades_df = self._ensure_ts_event_column(self._get_range_live("trades", start=start, end=end))
+        if trades_df.empty:
+            return pd.DataFrame(columns=["time", "count", "delta"])
+
+        required_columns = {"ts_event", "size", "side"}
+        if not required_columns.issubset(trades_df.columns):
+            missing = sorted(required_columns - set(trades_df.columns))
+            raise RuntimeError(f"Databento CME live trades response is missing expected columns: {missing}")
 
         trades_df = trades_df[["ts_event", "size", "side"]].copy()
         trades_df["ts_event"] = pd.to_datetime(trades_df["ts_event"], errors="coerce", utc=True)
@@ -1004,18 +1393,69 @@ class DatabentoCmeClient:
 
         latest_closed = _latest_closed_30m_open_time()
         end_time = min(_utc_naive(end), latest_closed + THIRTY_MINUTES)
-        bars_df = self._fetch_ohlcv_30m(start=start, end=end_time)
+        live_cutoff = pd.Timestamp.now(tz="UTC").tz_convert(None) - LIVE_REPLAY_LOOKBACK
+        start_time = _utc_naive(start)
+        source_start = start_time
+        cached_bars = pd.DataFrame()
+        cached_trades = pd.DataFrame()
+
+        if base_df is not None and not base_df.empty:
+            cached_times = _parse_utc_naive(base_df["time"])
+            latest_cached = cached_times.max()
+            if pd.notna(latest_cached):
+                warmup_start = max(start_time, pd.Timestamp(latest_cached) - (THIRTY_MINUTES * CME_INCREMENTAL_CACHE_WARMUP_BARS))
+                source_start = max(start_time, pd.Timestamp(latest_cached) - (THIRTY_MINUTES * CME_INCREMENTAL_FETCH_OVERLAP_BARS))
+                cached_bars, cached_trades = self._extract_cached_warmup_frames(base_df, warmup_start)
+
+        historical_bars = pd.DataFrame()
+        if source_start < min(end_time, live_cutoff):
+            try:
+                historical_bars = self._fetch_ohlcv_30m(start=source_start, end=min(end_time, live_cutoff))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Databento CME historical OHLCV fetch failed | start={source_start} | end={min(end_time, live_cutoff)} | reason={exc}"
+                ) from exc
+
+        recent_bars = pd.DataFrame()
+        if end_time > live_cutoff:
+            live_start = max(source_start, live_cutoff)
+            try:
+                recent_bars = self._fetch_ohlcv_30m_live(start=live_start, end=end_time)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Databento CME live OHLCV fetch failed | start={live_start} | end={end_time} | reason={exc}"
+                ) from exc
+            if recent_bars.empty:
+                try:
+                    recent_bars = self._fetch_ohlcv_30m(start=live_start, end=end_time)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Databento CME historical OHLCV fallback failed | start={live_start} | end={end_time} | reason={exc}"
+                    ) from exc
+
+        bars_df = _merge_time_frames(cached_bars, historical_bars, recent_bars)
         if bars_df.empty:
             return pd.DataFrame()
 
         cme_df = _candle_imbalance_proxy(bars_df, activity_column="volume", count_column="volume")
 
-        exact_start = max(_utc_naive(start), end_time - pd.Timedelta(hours=self.lookback_hours))
+        exact_start = max(source_start, end_time - pd.Timedelta(hours=self.lookback_hours))
         if exact_start < end_time:
             try:
-                trades_df = self._fetch_trade_metrics_30m(start=exact_start, end=end_time)
+                historical_trades = pd.DataFrame()
+                if exact_start < min(end_time, live_cutoff):
+                    historical_trades = self._fetch_trade_metrics_30m(start=exact_start, end=min(end_time, live_cutoff))
+
+                recent_trades = pd.DataFrame()
+                if end_time > live_cutoff:
+                    trades_start = max(exact_start, live_cutoff)
+                    recent_trades = self._fetch_trade_metrics_30m_live(start=trades_start, end=end_time)
+                    if recent_trades.empty:
+                        recent_trades = self._fetch_trade_metrics_30m(start=trades_start, end=end_time)
+
+                trades_df = _merge_time_frames(cached_trades, historical_trades, recent_trades)
             except Exception:
-                trades_df = pd.DataFrame(columns=["time", "count", "delta"])
+                trades_df = cached_trades.copy() if not cached_trades.empty else pd.DataFrame(columns=["time", "count", "delta"])
             if not trades_df.empty:
                 cme_df = cme_df.merge(trades_df, on="time", how="left", suffixes=("", "_exact"))
                 cme_df["count"] = cme_df["count_exact"].fillna(cme_df["count"]).round().astype("int64")
@@ -1061,7 +1501,7 @@ class DatabentoCmeClient:
         return _standardize_source_frame(prefixed[ordered], time_column="CME_time")
 
     def fetch_recent_processed(self, base_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        end = _latest_closed_30m_open_time() + THIRTY_MINUTES
+        end = _latest_closed_30m_fetch_end("Databento CME")
         start = end - pd.Timedelta(hours=self.lookback_hours)
         return self.fetch_processed_range(start=start, end=end, base_df=base_df)
 
@@ -1083,16 +1523,19 @@ class FredLiveDataClient:
         if not self.configured:
             return pd.DataFrame()
         padded_start = pd.Timestamp(start_date).normalize() - pd.Timedelta(days=30)
-        payload = self.http.get_json(
-            FRED_BASE_URL,
-            params={
-                "series_id": series_id,
-                "api_key": self.api_key,
-                "file_type": "json",
-                "observation_start": padded_start.strftime("%Y-%m-%d"),
-                "observation_end": pd.Timestamp(end_date).normalize().strftime("%Y-%m-%d"),
-            },
-        )
+        try:
+            payload = self.http.get_json(
+                FRED_BASE_URL,
+                params={
+                    "series_id": series_id,
+                    "api_key": self.api_key,
+                    "file_type": "json",
+                    "observation_start": padded_start.strftime("%Y-%m-%d"),
+                    "observation_end": pd.Timestamp(end_date).normalize().strftime("%Y-%m-%d"),
+                },
+            )
+        except Exception as exc:
+            raise RuntimeError(f"FRED series fetch failed | series_id={series_id} | reason={exc}") from exc
         observations = payload.get("observations", []) if isinstance(payload, dict) else []
         rows: list[dict[str, object]] = []
         for observation in observations:
@@ -1221,13 +1664,16 @@ class ModelSignalEngine:
         ) + max(int(settings.LIVE_BOOTSTRAP_1D_BUFFER_DAYS), 0)
         self.recent_30m_bars = max(int(settings.LIVE_RECENT_30M_BARS), 96)
         self.recent_1d_days = max(int(settings.LIVE_INCREMENTAL_1D_DAYS), 7)
+        # Incremental source refreshes need extra pre-roll so per-source
+        # indicators (RSI/ATR/BB/MACD) do not introduce NaNs at the refresh edge.
+        self.recent_30m_warmup_bars = max(int(settings.LIVE_BOOTSTRAP_30M_BUFFER_BARS), 96)
+        # Live trading thresholds are intentionally sourced from editable runtime
+        # settings so the bot/UI can change behavior without re-exporting a model
+        # checkpoint that may still carry older notebook defaults.
         self.decision_rule = DecisionRule(
-            max_flat_probability=float(
-                self.config.get("trade_rule_max_flat_prob", settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY)
-            ),
-            side_ratio_threshold=float(
-                self.config.get("trade_rule_side_ratio", settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD)
-            ),
+            max_flat_probability=float(settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY),
+            side_ratio_threshold=float(settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD),
+            ordering_max_flat_probability=float(settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY),
         )
 
         self.model = MultiTimescaleFusionModel(
@@ -1256,6 +1702,7 @@ class ModelSignalEngine:
         self.databento_client = DatabentoCmeClient(api_key=databento_api_key)
         self.fred_client = FredLiveDataClient(api_key=fred_api_key)
         self.coinalyze_client = CoinalyzeLiveDataClient(api_key=coinalyze_api_key)
+        self.last_post_close_daily_refresh_date: str | None = None
 
         self.coinbase_base = self._bootstrap_30m_cache(
             label="Coinbase",
@@ -1278,6 +1725,9 @@ class ModelSignalEngine:
             fetch_fn=lambda start, end, base: self.databento_client.fetch_processed_range(start=start, end=end, base_df=base),
         )
         self.daily_base = self._bootstrap_daily_cache()
+        self.daily_base = self._run_daily_refresh([], log_label="Gunluk startup refresh")
+        if self._is_after_us_market_close():
+            self.last_post_close_daily_refresh_date = self._us_market_date_key()
 
     def _required_30m_history_start(self) -> pd.Timestamp:
         latest_closed = _latest_closed_30m_open_time()
@@ -1287,9 +1737,55 @@ class ModelSignalEngine:
         anchor_end = pd.Timestamp.now(tz="UTC").tz_convert(None).normalize() - (ONE_DAY * self.daily_feature_lag_days)
         return anchor_end - pd.Timedelta(days=self.bootstrap_1d_days - 1)
 
+    def _us_market_now(self, now_utc: pd.Timestamp | None = None) -> pd.Timestamp:
+        now_utc = now_utc or pd.Timestamp.now(tz="UTC")
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.tz_localize("UTC")
+        else:
+            now_utc = now_utc.tz_convert("UTC")
+        return now_utc.tz_convert(US_MARKET_TIMEZONE)
+
+    def _us_market_date_key(self, now_utc: pd.Timestamp | None = None) -> str:
+        return self._us_market_now(now_utc).strftime("%Y-%m-%d")
+
+    def _is_after_us_market_close(self, now_utc: pd.Timestamp | None = None) -> bool:
+        market_now = self._us_market_now(now_utc)
+        cutoff = market_now.normalize() + pd.Timedelta(hours=US_MARKET_CLOSE_HOUR, minutes=US_MARKET_CLOSE_MINUTE)
+        return market_now >= cutoff
+
     def _log_note(self, note: str, notes: list[str]) -> None:
+        if notes and notes[-1] == note:
+            return
         notes.append(note)
-        self.logger(note)
+
+    def _source_latest_times(self) -> dict[str, pd.Timestamp]:
+        sources = {
+            "Coinbase": self.coinbase_base,
+            "Binance": self.binance_base,
+            "Bybit": self.bybit_base,
+            "Databento CME": self.cme_base,
+        }
+        latest_times: dict[str, pd.Timestamp] = {}
+        for name, df in sources.items():
+            if df is None or df.empty or "time" not in df.columns:
+                latest_times[name] = pd.NaT
+                continue
+            latest_times[name] = _parse_utc_naive(df["time"]).max()
+        return latest_times
+
+    def _has_required_30m_history(
+        self,
+        df: pd.DataFrame,
+        history_start: pd.Timestamp,
+        *,
+        require_contiguous_cache: bool,
+    ) -> bool:
+        return (
+            not df.empty
+            and df["time"].min() <= history_start
+            and len(df) >= self.window_size_30m
+            and (not require_contiguous_cache or not _has_large_30m_gap(df))
+        )
 
     def _bootstrap_30m_cache(
         self,
@@ -1299,18 +1795,34 @@ class ModelSignalEngine:
     ) -> pd.DataFrame:
         history_start = self._required_30m_history_start()
         cached = _trim_time_window(_load_time_cache(cache_path, time_column="time"), history_start)
-        has_required_history = not cached.empty and cached["time"].min() <= history_start and len(cached) >= self.window_size_30m
+        require_contiguous_cache = label in {"Coinbase", "Binance", "Bybit"}
+        has_required_history = self._has_required_30m_history(
+            cached,
+            history_start,
+            require_contiguous_cache=require_contiguous_cache,
+        )
         if has_required_history:
             _save_time_cache(cached, cache_path)
             return cached
         if label == "Databento CME" and cached.empty and not self.databento_client.configured:
             raise ValueError("Databento CME bootstrap icin Databento API key gerekli veya mevcut data/liveData CME cache'i bulunmali.")
 
-        fetched = _trim_time_window(fetch_fn(history_start, _latest_closed_30m_open_time() + THIRTY_MINUTES, cached), history_start)
+        fetch_seed = cached if has_required_history else pd.DataFrame()
+        fetched = _trim_time_window(
+            fetch_fn(history_start, _latest_closed_30m_fetch_end(label), fetch_seed),
+            history_start,
+        )
         if fetched.empty:
+            empty_note = (
+                "Databento CME bootstrap bos dondu; API key mevcut ama Databento hic bar dondurmedi."
+                if label == "Databento CME" and self.databento_client.configured
+                else f"{label} bootstrap bos dondu; mevcut liveData cache korunuyor."
+            )
             if not cached.empty:
-                self.logger(f"{label} bootstrap bos dondu; mevcut liveData cache korunuyor.")
+                self.logger(empty_note + (" Mevcut liveData cache korunuyor." if label == "Databento CME" and self.databento_client.configured else ""))
                 return cached
+            if label == "Databento CME" and self.databento_client.configured:
+                raise ValueError("Databento CME bootstrap bos dondu; API key mevcut ama Databento hic bar dondurmedi ve liveData cache bulunmuyor.")
             raise ValueError(f"{label} live bootstrap failed and no liveData cache exists.")
 
         _save_time_cache(fetched, cache_path)
@@ -1342,13 +1854,19 @@ class ModelSignalEngine:
         if cached.empty and (not self.fred_client.configured or not self.coinalyze_client.configured):
             raise ValueError("Gunluk bootstrap icin hem FRED API key hem Coinalyze API key gerekli veya mevcut data/liveData daily cache'i bulunmali.")
 
-        fetched = _trim_daily_window(
-            self._fetch_daily_merged(
-                start_date=history_start,
-                end_date=pd.Timestamp.now(tz="UTC").tz_convert(None).normalize(),
-            ),
-            history_start,
-        )
+        try:
+            fetched = _trim_daily_window(
+                self._fetch_daily_merged(
+                    start_date=history_start,
+                    end_date=pd.Timestamp.now(tz="UTC").tz_convert(None).normalize(),
+                ),
+                history_start,
+            )
+        except Exception as exc:
+            if not cached.empty:
+                self.logger(f"Gunluk bootstrap failed; mevcut liveData cache korunuyor. reason={exc}")
+                return cached
+            raise
         if fetched.empty:
             if not cached.empty:
                 self.logger("Gunluk bootstrap bos dondu; mevcut liveData cache korunuyor.")
@@ -1366,24 +1884,75 @@ class ModelSignalEngine:
         cache_path: Path,
         fetch_fn: Callable[[pd.Timestamp, pd.Timestamp, pd.DataFrame], pd.DataFrame],
         notes: list[str],
+        *,
+        is_source_configured: bool = True,
+        missing_config_note: str | None = None,
     ) -> pd.DataFrame:
         history_start = self._required_30m_history_start()
-        recent_start = max(history_start, _latest_closed_30m_open_time() - (THIRTY_MINUTES * (self.recent_30m_bars - 1)))
+        source_latest_closed = _latest_closed_cme_30m_open_time() if label == "Databento CME" else _latest_closed_30m_open_time()
+        recent_start = max(history_start, source_latest_closed - (THIRTY_MINUTES * (self.recent_30m_bars - 1)))
+        require_contiguous_cache = label in {"Coinbase", "Binance", "Bybit"}
+        has_required_history = self._has_required_30m_history(
+            _trim_time_window(base_df, history_start),
+            history_start,
+            require_contiguous_cache=require_contiguous_cache,
+        )
+        force_full_backfill = not has_required_history
+        fetch_start = history_start if force_full_backfill else max(
+            history_start,
+            recent_start - (THIRTY_MINUTES * self.recent_30m_warmup_bars),
+        )
+        if not is_source_configured:
+            self._log_note(
+                missing_config_note or f"{label} recent update atlandi; kaynak konfiguru yok, liveData cache kullaniliyor.",
+                notes,
+            )
+            return _trim_time_window(base_df, history_start)
         try:
-            recent = fetch_fn(recent_start, _latest_closed_30m_open_time() + THIRTY_MINUTES, base_df)
+            fetch_seed = base_df if has_required_history else pd.DataFrame()
+            recent = fetch_fn(fetch_start, _latest_closed_30m_fetch_end(label), fetch_seed)
+            recent = _trim_time_window(recent, history_start if force_full_backfill else recent_start)
             if recent.empty:
-                self._log_note(f"{label} recent update returned no closed bars; liveData cache kullaniliyor.", notes)
+                if label == "Databento CME" and is_source_configured:
+                    self._log_note(
+                        "Databento CME recent update returned no closed bars despite configured API key; liveData cache kullaniliyor.",
+                        notes,
+                    )
+                else:
+                    self._log_note(f"{label} recent update returned no closed bars; liveData cache kullaniliyor.", notes)
                 return _trim_time_window(base_df, history_start)
 
             updated = _trim_time_window(_overlay_processed_frames(base_df, recent), history_start)
             _save_time_cache(updated, cache_path)
+            updated_latest = _parse_utc_naive(updated["time"]).max() if not updated.empty else pd.NaT
+            expected_latest = source_latest_closed
+            if label == "Databento CME" and (pd.isna(updated_latest) or updated_latest < expected_latest):
+                self._log_note(
+                    "Databento CME recent update son kapali mumu yetistiremedi; "
+                    f"latest_utc={(updated_latest.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(updated_latest) else 'missing')} | "
+                    f"expected_utc={expected_latest:%Y-%m-%d %H:%M:%S}",
+                    notes,
+                )
             return updated
         except Exception as exc:
             self._log_note(f"{label} recent update failed; liveData cache kullaniliyor. reason={exc}", notes)
             return _trim_time_window(base_df, history_start)
 
-    def _refresh_daily_cache(self, notes: list[str]) -> pd.DataFrame:
+    def _run_daily_refresh(self, notes: list[str], *, log_label: str) -> pd.DataFrame:
         history_start = self._required_1d_history_start()
+        base_daily = _trim_daily_window(self.daily_base, history_start)
+        missing_sources: list[str] = []
+        if not self.fred_client.configured:
+            missing_sources.append("FRED")
+        if not self.coinalyze_client.configured:
+            missing_sources.append("Coinalyze")
+        if missing_sources:
+            self._log_note(
+                f"{log_label} atlandi; eksik API key: {', '.join(missing_sources)}. liveData cache kullaniliyor.",
+                notes,
+            )
+            return base_daily
+
         recent_start = max(history_start, pd.Timestamp.now(tz="UTC").tz_convert(None).normalize() - pd.Timedelta(days=self.recent_1d_days))
         try:
             recent = self._fetch_daily_merged(
@@ -1391,15 +1960,31 @@ class ModelSignalEngine:
                 end_date=pd.Timestamp.now(tz="UTC").tz_convert(None).normalize(),
             )
             if recent.empty:
-                self._log_note("Gunluk recent update bos dondu; liveData cache kullaniliyor.", notes)
-                return _trim_daily_window(self.daily_base, history_start)
+                self._log_note(f"{log_label} bos dondu; liveData cache kullaniliyor.", notes)
+                return base_daily
 
-            updated = _trim_daily_window(_overlay_daily_frames(self.daily_base, recent), history_start)
+            updated = _trim_daily_window(_overlay_daily_frames(base_daily, recent), history_start)
             _save_daily_cache(updated, LIVE_DAILY_PATH)
+            self.logger(f"{log_label} tamamlandi | rows={len(updated)}")
             return updated
         except Exception as exc:
-            self._log_note(f"Gunluk recent update failed; liveData cache kullaniliyor. reason={exc}", notes)
-            return _trim_daily_window(self.daily_base, history_start)
+            self._log_note(f"{log_label} failed; liveData cache kullaniliyor. reason={exc}", notes)
+            return base_daily
+
+    def _refresh_daily_cache_if_due(self, notes: list[str]) -> pd.DataFrame:
+        history_start = self._required_1d_history_start()
+        self.daily_base = _trim_daily_window(self.daily_base, history_start)
+        now_utc = pd.Timestamp.now(tz="UTC")
+        if not self._is_after_us_market_close(now_utc):
+            return self.daily_base
+
+        market_date = self._us_market_date_key(now_utc)
+        if self.last_post_close_daily_refresh_date == market_date:
+            return self.daily_base
+
+        self.last_post_close_daily_refresh_date = market_date
+        self.daily_base = self._run_daily_refresh(notes, log_label="Gunluk kapanis refresh")
+        return self.daily_base
 
     def _build_updated_sources(self) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         notes: list[str] = []
@@ -1431,12 +2016,37 @@ class ModelSignalEngine:
             cache_path=LIVE_CME_PATH,
             fetch_fn=lambda start, end, base: self.databento_client.fetch_processed_range(start=start, end=end, base_df=base),
             notes=notes,
+            is_source_configured=self.databento_client.configured,
+            missing_config_note="Databento CME recent update atlandi; Databento API key yok, liveData cache kullaniliyor.",
         )
-        self.daily_base = self._refresh_daily_cache(notes)
+        self.daily_base = self._refresh_daily_cache_if_due(notes)
 
         merged_30m = self.coinbase_base.merge(self.binance_base, on="time", how="inner", validate="one_to_one")
         merged_30m = merged_30m.merge(self.bybit_base, on="time", how="inner", validate="one_to_one")
-        merged_30m = merged_30m.merge(self.cme_base, on="time", how="inner", validate="one_to_one")
+
+        cme_for_merge, synthetic_cme_times = _synthesize_missing_cme_rows(self.cme_base, merged_30m["time"])
+        actual_cme_latest = _parse_utc_naive(self.cme_base["time"]).max() if not self.cme_base.empty else pd.NaT
+        current_synthetic_cme_times = [
+            ts for ts in synthetic_cme_times if pd.isna(actual_cme_latest) or ts > actual_cme_latest
+        ]
+        if current_synthetic_cme_times:
+            special_reason = _cme_special_session_reason(actual_cme_latest) if pd.notna(actual_cme_latest) else None
+            note_prefix = (
+                f"Databento CME resmi seans kapanisi algilandi ({special_reason}); "
+                if special_reason
+                else "Databento CME eksik mumlar sentetik dolduruldu; "
+            )
+            self._log_note(
+                note_prefix
+                + 
+                "fiyat kolonlari bir onceki CME satirindan kopyalandi, volume/count/delta=0 yapildi | "
+                f"rows={len(current_synthetic_cme_times)} | "
+                f"first_utc={current_synthetic_cme_times[0]:%Y-%m-%d %H:%M:%S} | "
+                f"last_utc={current_synthetic_cme_times[-1]:%Y-%m-%d %H:%M:%S}",
+                notes,
+            )
+
+        merged_30m = merged_30m.merge(cme_for_merge, on="time", how="inner", validate="one_to_one")
         merged_30m = _drop_helper_open_time_columns(merged_30m).sort_values("time").reset_index(drop=True)
 
         if merged_30m.empty:
@@ -1493,10 +2103,33 @@ class ModelSignalEngine:
         merged_1d = merged_1d.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
         latest_available = merged_30m["time"].max()
-        expected_latest = _latest_closed_30m_open_time()
-        if pd.isna(latest_available) or latest_available < expected_latest - (2 * THIRTY_MINUTES):
-            raise ValueError(
-                f"Live cache is stale. latest_merged_bar={latest_available} expected_at_least={expected_latest - (2 * THIRTY_MINUTES)}"
+        expected_latest = _latest_expected_common_30m_open_time()
+        if pd.isna(latest_available) or latest_available < expected_latest:
+            source_latest_times = self._source_latest_times()
+            lagging_sources = [
+                f"{name} latest_utc={(latest.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(latest) else 'missing')}"
+                for name, latest in source_latest_times.items()
+                if pd.isna(latest) or latest < expected_latest
+            ]
+            if not lagging_sources:
+                lagging_sources.append(
+                    f"common_merge latest_utc={(pd.Timestamp(latest_available).strftime('%Y-%m-%d %H:%M:%S') if pd.notna(latest_available) else 'missing')}"
+                )
+
+            reason_suffix = ""
+            if notes:
+                reason_suffix = f" | neden={notes[-1]}"
+
+            raise LatestBarPendingError(
+                "Son ortak mum icin veri eksik; sinyal uretilmedi | "
+                f"hedef_mum_utc={expected_latest:%Y-%m-%d %H:%M:%S} | "
+                f"ortak_son_mum_utc={(pd.Timestamp(latest_available).strftime('%Y-%m-%d %H:%M:%S') if pd.notna(latest_available) else 'missing')} | "
+                f"eksik_kaynaklar={', '.join(lagging_sources)}"
+                f"{reason_suffix}",
+                expected_latest=expected_latest,
+                latest_available=(pd.Timestamp(latest_available) if pd.notna(latest_available) else None),
+                lagging_sources=tuple(lagging_sources),
+                notes=tuple(notes),
             )
 
         merged_30m["raw_30m_idx"] = np.arange(len(merged_30m), dtype=np.int64)

@@ -26,6 +26,7 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
 import bot_settings as settings
+from live_model_runtime import LatestBarPendingError
 from live_model_runtime import ModelSignalEngine as MultiBranchModelSignalEngine
 
 
@@ -49,6 +50,8 @@ EIGHT_HOURS_MS = 8 * 60 * 60 * 1000
 KLINE_INTERVAL = "30m"
 LEGACY_BINANCE_DEMO_BASE_URL = "https://testnet.binancefuture.com"
 CANONICAL_BINANCE_DEMO_BASE_URL = "https://demo-fapi.binance.com"
+TRANSIENT_DATABENTO_RETRY_SECONDS = 10.0
+ENTRY_MARGIN_FEE_BUFFER_RATE = 0.0005
 
 
 class EncoderOnlyTransformer(nn.Module):
@@ -107,6 +110,7 @@ class RiskProfile:
     name: str
     max_flat_probability: float
     side_ratio_threshold: float
+    ordering_max_flat_probability: float
     flat_keeps_position: bool
     reverse_reopens_position: bool
     same_direction_scale_multiplier: float
@@ -116,10 +120,13 @@ class RiskProfile:
         flat_gate = p_hold < self.max_flat_probability
         long_mask = flat_gate and (p_buy > self.side_ratio_threshold * p_sell)
         short_mask = flat_gate and (not long_mask) and (p_sell > self.side_ratio_threshold * p_buy)
+        ordering_gate = p_hold < self.ordering_max_flat_probability
+        ordering_long_mask = ordering_gate and (p_buy > p_hold > p_sell)
+        ordering_short_mask = ordering_gate and (p_sell > p_hold > p_buy)
 
-        if long_mask:
+        if long_mask or ordering_long_mask:
             return "up"
-        if short_mask:
+        if short_mask or ordering_short_mask:
             return "down"
         return "flat"
 
@@ -129,6 +136,7 @@ RISK_PROFILES = {
         name=RISK_HIGH,
         max_flat_probability=settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
         side_ratio_threshold=settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
+        ordering_max_flat_probability=settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY,
         flat_keeps_position=True,
         reverse_reopens_position=True,
         same_direction_scale_multiplier=1.5,
@@ -138,6 +146,7 @@ RISK_PROFILES = {
         name=RISK_LOW,
         max_flat_probability=settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
         side_ratio_threshold=settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
+        ordering_max_flat_probability=settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY,
         flat_keeps_position=False,
         reverse_reopens_position=False,
         same_direction_scale_multiplier=1.0,
@@ -859,11 +868,16 @@ class TradeBotController:
             coinalyze_api_key=coinalyze_api_key,
             logger=logger,
         )
+        self.risk_profile = RISK_PROFILES[RISK_HIGH]
         self.symbol_rules = self.public_client.get_exchange_info(settings.SYMBOL)
         self.stop_event = threading.Event()
         self.last_processed_bar: pd.Timestamp | None = None
+        self.last_wait_reason: str | None = None
+        self.last_databento_retry_target: pd.Timestamp | None = None
+        self.tracked_position_side: str | None = None
+        self.same_direction_signal_count = 0
         self.state_file = state_file or DEFAULT_STATE_FILE
-        self.last_processed_bar = self._load_last_processed_bar()
+        self._load_runtime_state()
 
     def validate_credentials(self) -> None:
         if not self.demo_client.api_key or not self.demo_client.api_secret:
@@ -878,7 +892,8 @@ class TradeBotController:
             f"risk_per_trade={settings.ACCOUNT_RISK_PER_TRADE * 100:.2f}% | "
             f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x | "
             f"flat_gate<{self.signal_engine.decision_rule.max_flat_probability:.2f} | "
-            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f}"
+            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f} | "
+            f"ordering_flat<{self.signal_engine.decision_rule.ordering_max_flat_probability:.2f}"
         )
         self.run_loop()
 
@@ -891,7 +906,8 @@ class TradeBotController:
             f"risk_per_trade={settings.ACCOUNT_RISK_PER_TRADE * 100:.2f}% | "
             f"sl_factor={settings.STOP_LOSS_FACTOR:.2f} | leverage={settings.LEVERAGE}x | "
             f"flat_gate<{self.signal_engine.decision_rule.max_flat_probability:.2f} | "
-            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f}"
+            f"side_ratio>{self.signal_engine.decision_rule.side_ratio_threshold:.2f} | "
+            f"ordering_flat<{self.signal_engine.decision_rule.ordering_max_flat_probability:.2f}"
         )
         self.housekeep_orders()
         self.process_if_new_bar()
@@ -909,7 +925,8 @@ class TradeBotController:
                         self.housekeep_orders()
                         if self.process_if_new_bar():
                             break
-                        self.logger("Yeni kapanan mum henuz hazir degil; kisa sure sonra tekrar denenecek.")
+                        if self.last_wait_reason is None:
+                            self.logger("Yeni kapanan mum henuz hazir degil; kisa sure sonra tekrar denenecek.")
                     except Exception as exc:
                         self.logger(f"Hata: {exc}")
 
@@ -922,16 +939,20 @@ class TradeBotController:
 
     def wait_until_next_bar_close(self) -> bool:
         interval_ms = settings.BAR_INTERVAL_MINUTES * 60 * 1000
-        buffer_ms = int(settings.BAR_CLOSE_BUFFER_SECONDS * 1000)
+        buffer_seconds = max(float(settings.BAR_CLOSE_BUFFER_SECONDS), 30.0)
+        buffer_ms = int(buffer_seconds * 1000)
         server_time = self.public_client.get_server_time()
         next_close_ms = ((server_time // interval_ms) + 1) * interval_ms
         target_ms = next_close_ms + buffer_ms
         wait_seconds = max(0.0, (target_ms - server_time) / 1000.0)
 
         next_close_time = pd.to_datetime(next_close_ms, unit="ms", utc=True).tz_localize(None)
+        request_time = pd.to_datetime(target_ms, unit="ms", utc=True).tz_localize(None)
         self.logger(
             f"Sonraki {settings.BAR_INTERVAL_MINUTES}m mum kapanisi bekleniyor: "
-            f"{next_close_time:%Y-%m-%d %H:%M}"
+            f"kapanis_utc={next_close_time:%Y-%m-%d %H:%M:%S} | "
+            f"istek_en_erken_utc={request_time:%Y-%m-%d %H:%M:%S} | "
+            f"buffer={buffer_seconds:.0f}s"
         )
         remaining = wait_seconds
         while remaining > 0:
@@ -958,7 +979,40 @@ class TradeBotController:
             self.logger(f"Pozisyon yokken kalan {cancelled_total} bot emri iptal edildi.")
 
     def process_if_new_bar(self) -> bool:
-        snapshot = self.signal_engine.predict_latest()
+        if self.last_wait_reason is None:
+            self.logger("Yeni kapanan mum algilandi; kaynaklar yenileniyor ve sinyal hesaplaniyor.")
+        try:
+            snapshot = self.signal_engine.predict_latest()
+        except LatestBarPendingError as exc:
+            retry_exception = exc
+            if self._should_retry_transient_databento_lag(exc):
+                self.last_databento_retry_target = pd.Timestamp(exc.expected_latest)
+                self.logger(
+                    f"Databento CME son kapali mumda gecikmeli gorunuyor; "
+                    f"{TRANSIENT_DATABENTO_RETRY_SECONDS:.0f}s bekleyip ayni mum icin tekrar denenecek."
+                )
+                if self.stop_event.wait(TRANSIENT_DATABENTO_RETRY_SECONDS):
+                    return False
+                try:
+                    snapshot = self.signal_engine.predict_latest()
+                except LatestBarPendingError as retry_exc:
+                    retry_exception = retry_exc
+                else:
+                    self.last_wait_reason = None
+                    self.last_databento_retry_target = None
+                    return self._handle_ready_snapshot(snapshot)
+
+            reason = str(retry_exception)
+            if self.last_wait_reason != reason:
+                self.logger(reason)
+            self.last_wait_reason = reason
+            return False
+
+        self.last_wait_reason = None
+        self.last_databento_retry_target = None
+        return self._handle_ready_snapshot(snapshot)
+
+    def _handle_ready_snapshot(self, snapshot) -> bool:
         label = self.signal_engine.decision_rule.derive_trade_label(
             p_buy=snapshot.probs["p_up"],
             p_hold=snapshot.probs["p_flat"],
@@ -966,12 +1020,12 @@ class TradeBotController:
         )
 
         if self.last_processed_bar is not None and snapshot.bar_time <= self.last_processed_bar:
-            return False
+            return True
 
         self.last_processed_bar = snapshot.bar_time
-        self._persist_last_processed_bar(snapshot.bar_time)
+        self._persist_runtime_state()
         self.logger(
-            f"{snapshot.bar_time:%Y-%m-%d %H:%M} kapandi | close={snapshot.close_price:.2f} | "
+            f"{snapshot.bar_time:%Y-%m-%d %H:%M} UTC kapandi | close={snapshot.close_price:.2f} | "
             f"p_up={snapshot.probs['p_up']:.4f} p_flat={snapshot.probs['p_flat']:.4f} "
             f"p_down={snapshot.probs['p_down']:.4f} | signal={label}"
         )
@@ -981,29 +1035,74 @@ class TradeBotController:
         self.apply_trade_rules(snapshot, signal=label)
         return True
 
-    def _load_last_processed_bar(self) -> pd.Timestamp | None:
+    def _should_retry_transient_databento_lag(self, exc: LatestBarPendingError) -> bool:
+        expected_latest = getattr(exc, "expected_latest", None)
+        latest_available = getattr(exc, "latest_available", None)
+        lagging_sources = tuple(getattr(exc, "lagging_sources", ()))
+        notes = tuple(getattr(exc, "notes", ()))
+        if expected_latest is None or latest_available is None:
+            return False
+
+        expected_ts = pd.Timestamp(expected_latest)
+        latest_ts = pd.Timestamp(latest_available)
+        if pd.isna(expected_ts) or pd.isna(latest_ts):
+            return False
+        if len(lagging_sources) != 1 or not lagging_sources[0].startswith("Databento CME latest_utc="):
+            return False
+        if self.last_databento_retry_target is not None and expected_ts == self.last_databento_retry_target:
+            return False
+
+        expected_gap = pd.Timedelta(minutes=settings.BAR_INTERVAL_MINUTES)
+        if latest_ts != expected_ts - expected_gap:
+            return False
+
+        return any("Databento CME recent update son kapali mumu yetistiremedi" in note for note in notes)
+
+    def _load_runtime_state(self) -> None:
         try:
             if not self.state_file.exists():
-                return None
+                return
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
             value = payload.get("last_processed_bar")
-            if not value:
-                return None
-            ts = pd.to_datetime(value, errors="coerce")
-            return None if pd.isna(ts) else ts
-        except Exception:
-            return None
+            if value:
+                ts = pd.to_datetime(value, errors="coerce")
+                if not pd.isna(ts):
+                    self.last_processed_bar = ts
 
-    def _persist_last_processed_bar(self, bar_time: pd.Timestamp) -> None:
+            side = str(payload.get("tracked_position_side", "")).upper()
+            if side in {POSITION_LONG, POSITION_SHORT}:
+                self.tracked_position_side = side
+
+            count = payload.get("same_direction_signal_count", 0)
+            try:
+                parsed_count = int(count)
+            except (TypeError, ValueError):
+                parsed_count = 0
+            self.same_direction_signal_count = max(parsed_count, 0) if self.tracked_position_side else 0
+        except Exception:
+            self.last_processed_bar = None
+            self.tracked_position_side = None
+            self.same_direction_signal_count = 0
+
+    def _persist_runtime_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"last_processed_bar": bar_time.strftime("%Y-%m-%d %H:%M:%S")}
+            payload: dict[str, str | int | None] = {
+                "last_processed_bar": (
+                    self.last_processed_bar.strftime("%Y-%m-%d %H:%M:%S")
+                    if self.last_processed_bar is not None
+                    else None
+                ),
+                "tracked_position_side": self.tracked_position_side,
+                "same_direction_signal_count": self.same_direction_signal_count,
+            }
             self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:
             self.logger(f"State dosyasi yazilamadi: {exc}")
 
     def apply_trade_rules(self, snapshot: object, signal: str) -> None:
         position = self.demo_client.get_position(settings.SYMBOL)
+        self._reconcile_position_tracking(position)
 
         if not position.is_open:
             if signal in {"up", "down"}:
@@ -1032,17 +1131,49 @@ class TradeBotController:
             self.open_new_position(signal, snapshot)
 
     def handle_same_direction_signal(self, position: PositionState, snapshot: object) -> None:
-        target_notional, balance_state = self.compute_risk_based_notional(snapshot)
+        next_signal_count = max(self.same_direction_signal_count, 1) + 1
+        risk_multiplier = self._risk_multiplier_for_signal_count(next_signal_count)
+        target_notional, balance_state, risk_budget = self.compute_risk_based_notional(
+            snapshot,
+            risk_multiplier=risk_multiplier,
+        )
+        capped_target_notional = self.cap_target_notional_for_available_margin(
+            target_notional,
+            balance_state,
+            current_notional=position.notional,
+        )
+        if capped_target_notional < target_notional - 1e-9:
+            self.logger(
+                f"Hedef notional available margin icin asagi cekildi | "
+                f"raw_target={target_notional:.2f} | capped_target={capped_target_notional:.2f}"
+            )
+        target_notional = capped_target_notional
         self.logger(
-            f"Ayni yon sinyali | current_notional={position.notional:.2f} | "
-            f"target_notional={target_notional:.2f} | equity={balance_state.equity:.2f}"
+            f"Ayni yon sinyali | sinyal_sayisi={next_signal_count} | risk_butcesi={risk_budget:.2f} | "
+            f"risk_carpani={risk_multiplier:.2f}x | current_notional={position.notional:.2f} | "
+            f"target_notional={target_notional:.2f} | equity={balance_state.equity:.2f} | "
+            f"available={balance_state.available_balance:.2f}"
         )
         position = self.rebalance_position_to_target_notional(position, snapshot, target_notional)
+        self._set_position_signal_state(position.side, next_signal_count)
         self.place_or_refresh_protection(position, snapshot)
 
     def open_new_position(self, signal: str, snapshot: object) -> None:
         side = ORDER_SIDE_BUY if signal == "up" else ORDER_SIDE_SELL
-        target_notional, balance_state = self.compute_risk_based_notional(snapshot)
+        target_notional, balance_state, risk_budget = self.compute_risk_based_notional(snapshot)
+        capped_target_notional = self.cap_target_notional_for_available_margin(
+            target_notional,
+            balance_state,
+            current_notional=0.0,
+        )
+        if capped_target_notional <= 0:
+            raise ValueError("Acik available margin yok; yeni pozisyon acilamiyor.")
+        if capped_target_notional < target_notional - 1e-9:
+            self.logger(
+                f"Entry target notional available margin icin asagi cekildi | "
+                f"raw_target={target_notional:.2f} | capped_target={capped_target_notional:.2f}"
+            )
+        target_notional = capped_target_notional
         quantity = self.quantity_for_notional(target_notional, snapshot.close_price)
         if quantity <= 0:
             raise ValueError("Hesaplanan quantity 0 cikti; base notional veya leverage yetersiz olabilir.")
@@ -1059,9 +1190,11 @@ class TradeBotController:
         if not position.is_open:
             raise RuntimeError("Pozisyon acma emri gonderildi ama acik pozisyon bulunamadi.")
 
+        self._set_position_signal_state(position.side, 1)
         self.logger(
             f"Yeni pozisyon acildi | side={position.side} | qty={position.quantity:.3f} | "
-            f"entry={position.entry_price:.2f} | target_notional={target_notional:.2f} | equity={balance_state.equity:.2f}"
+            f"entry={position.entry_price:.2f} | risk_butcesi={risk_budget:.2f} | "
+            f"target_notional={target_notional:.2f} | equity={balance_state.equity:.2f}"
         )
         self.place_or_refresh_protection(position, snapshot)
 
@@ -1075,6 +1208,7 @@ class TradeBotController:
             reduce_only=True,
             client_order_id=f"{settings.ORDER_CLIENT_PREFIX}_close_{now_ms()}",
         )
+        self._set_position_signal_state(None, 0)
         self.logger(f"Pozisyon kapatildi | reason={reason}")
         time.sleep(1.0)
 
@@ -1112,17 +1246,64 @@ class TradeBotController:
         adjusted_notional = max(notional_usdt, min_notional)
         return adjusted_notional / price
 
-    def compute_risk_based_notional(self, snapshot: object) -> tuple[float, AccountBalanceState]:
+    def compute_risk_based_notional(
+        self,
+        snapshot: object,
+        *,
+        risk_multiplier: float = 1.0,
+    ) -> tuple[float, AccountBalanceState, float]:
         stop_distance = snapshot.barrier_width * settings.STOP_LOSS_FACTOR
         if not np.isfinite(stop_distance) or stop_distance <= 0:
             raise ValueError("Stop distance hesaplanamadi.")
 
         balance_state = self.demo_client.get_account_balance()
-        risk_budget = balance_state.equity * settings.ACCOUNT_RISK_PER_TRADE
+        risk_budget = balance_state.equity * settings.ACCOUNT_RISK_PER_TRADE * max(float(risk_multiplier), 0.0)
         raw_notional = risk_budget * snapshot.close_price / stop_distance
         max_notional_by_leverage = balance_state.equity * settings.LEVERAGE
         target_notional = min(raw_notional, max_notional_by_leverage)
-        return target_notional, balance_state
+        return target_notional, balance_state, risk_budget
+
+    def _risk_multiplier_for_signal_count(self, signal_count: int) -> float:
+        if not self.risk_profile.same_direction_grows_position:
+            return 1.0
+        return self.risk_profile.same_direction_scale_multiplier if signal_count >= 2 else 1.0
+
+    def _reconcile_position_tracking(self, position: PositionState) -> None:
+        if not position.is_open:
+            self._set_position_signal_state(None, 0)
+            return
+        if self.tracked_position_side != position.side or self.same_direction_signal_count < 1:
+            self._set_position_signal_state(position.side, 1)
+
+    def _set_position_signal_state(self, position_side: str | None, signal_count: int) -> None:
+        normalized_side = position_side if position_side in {POSITION_LONG, POSITION_SHORT} else None
+        normalized_count = max(int(signal_count), 0) if normalized_side else 0
+        if (
+            self.tracked_position_side == normalized_side
+            and self.same_direction_signal_count == normalized_count
+        ):
+            return
+        self.tracked_position_side = normalized_side
+        self.same_direction_signal_count = normalized_count
+        self._persist_runtime_state()
+
+    def cap_target_notional_for_available_margin(
+        self,
+        target_notional: float,
+        balance_state: AccountBalanceState,
+        *,
+        current_notional: float,
+    ) -> float:
+        leverage = max(float(settings.LEVERAGE), 1.0)
+        effective_margin_per_notional = (1.0 / leverage) + ENTRY_MARGIN_FEE_BUFFER_RATE
+        if effective_margin_per_notional <= 0:
+            return target_notional
+
+        available_balance = max(float(balance_state.available_balance), 0.0)
+        current_notional = max(float(current_notional), 0.0)
+        max_additional_notional = available_balance / effective_margin_per_notional
+        max_total_notional = current_notional + max_additional_notional
+        return min(float(target_notional), max_total_notional)
 
     def rebalance_position_to_target_notional(
         self,
@@ -1162,13 +1343,27 @@ class TradeBotController:
         return updated_position
 
     def quantity_for_notional(self, notional_usdt: float, price: float) -> float:
-        raw_qty = self.notional_to_quantity(notional_usdt, price)
+        if price <= 0:
+            return 0.0
+
+        raw_qty = max(float(notional_usdt), 0.0) / price
         step = float(self.symbol_rules.step_size)
         min_qty = float(self.symbol_rules.min_qty)
+        min_notional = float(self.symbol_rules.min_notional)
+        min_valid_qty = max(min_qty, min_notional / price)
+
         if step <= 0:
-            return max(raw_qty, min_qty)
-        steps = math.ceil((raw_qty / step) - 1e-12)
-        qty = max(steps * step, min_qty)
+            qty = max(raw_qty, min_valid_qty)
+            return round(qty, self.symbol_rules.quantity_precision)
+
+        min_steps = math.ceil((min_valid_qty / step) - 1e-12)
+        min_step_qty = max(min_steps * step, min_qty)
+        if raw_qty <= min_step_qty:
+            qty = min_step_qty
+        else:
+            qty = round_down(raw_qty, self.symbol_rules.step_size)
+            if qty < min_step_qty:
+                qty = min_step_qty
         return round(qty, self.symbol_rules.quantity_precision)
 
     def round_quantity(self, quantity: float) -> float:
@@ -1202,6 +1397,10 @@ class DashboardState:
     controller: TradeBotController | None = None
     worker_thread: threading.Thread | None = None
     last_error: str | None = None
+    has_runtime_keys: bool = False
+    has_runtime_databento_config: bool = False
+    has_runtime_fred_config: bool = False
+    has_runtime_coinalyze_config: bool = False
 
 
 class BotDashboard:
@@ -1230,6 +1429,11 @@ class BotDashboard:
                 return False, "Bot zaten calisiyor."
             self.state.status = "Baslatiliyor..."
             self.state.last_error = None
+            self.state.logs = []
+            self.state.has_runtime_keys = False
+            self.state.has_runtime_databento_config = False
+            self.state.has_runtime_fred_config = False
+            self.state.has_runtime_coinalyze_config = False
             worker = threading.Thread(
                 target=self._run_bot_thread,
                 args=(
@@ -1262,6 +1466,11 @@ class BotDashboard:
             resolved_databento_api_key = databento_api_key or settings.DATABENTO_API_KEY
             resolved_fred_api_key = fred_api_key or settings.FRED_API_KEY
             resolved_coinalyze_api_key = coinalyze_api_key or settings.COINALYZE_API_KEY
+            with self.lock:
+                self.state.has_runtime_keys = bool(resolved_api_key and resolved_api_secret)
+                self.state.has_runtime_databento_config = bool(resolved_databento_api_key)
+                self.state.has_runtime_fred_config = bool(resolved_fred_api_key)
+                self.state.has_runtime_coinalyze_config = bool(resolved_coinalyze_api_key)
             controller = TradeBotController(
                 logger=self.log,
                 api_key=resolved_api_key,
@@ -1310,12 +1519,13 @@ class BotDashboard:
                 "leverage": settings.LEVERAGE,
                 "risk_per_trade_pct": round(settings.ACCOUNT_RISK_PER_TRADE * 100.0, 4),
                 "stop_loss_factor": settings.STOP_LOSS_FACTOR,
-                "has_settings_keys": bool(settings.BINANCE_DEMO_API_KEY and settings.BINANCE_DEMO_API_SECRET),
+                "has_settings_keys": self.state.has_runtime_keys or bool(settings.BINANCE_DEMO_API_KEY and settings.BINANCE_DEMO_API_SECRET),
                 "trade_rule_max_flat_prob": settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY,
                 "trade_rule_side_ratio": settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD,
-                "has_databento_config": bool(settings.DATABENTO_API_KEY),
-                "has_fred_config": bool(settings.FRED_API_KEY),
-                "has_coinalyze_config": bool(settings.COINALYZE_API_KEY),
+                "trade_rule_ordering_flat_prob": settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY,
+                "has_databento_config": self.state.has_runtime_databento_config or bool(settings.DATABENTO_API_KEY),
+                "has_fred_config": self.state.has_runtime_fred_config or bool(settings.FRED_API_KEY),
+                "has_coinalyze_config": self.state.has_runtime_coinalyze_config or bool(settings.COINALYZE_API_KEY),
             }
 
     def create_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -1662,13 +1872,18 @@ def build_dashboard_html() -> str:
           <div class="stat"><div class="k">Symbol</div><div class="v">{settings.SYMBOL}</div></div>
           <div class="stat"><div class="k">Leverage</div><div class="v">{settings.LEVERAGE}x</div></div>
           <div class="stat"><div class="k">Risk / Trade</div><div class="v">%{settings.ACCOUNT_RISK_PER_TRADE * 100:.0f}</div></div>
-          <div class="stat"><div class="k">Rule</div><div class="v">flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</div></div>
+          <div class="stat"><div class="k">Rule</div><div class="v">flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f} or ordering &lt; {settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY:.2f}</div></div>
         </div>
         <div class="banner">
-          Giris mantigi notebook ile ayni:
-          <code>p_flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</code> ise,
+          Aktif giris mantigi:
+          <code>p_flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</code> ve
           <code>up &gt; {settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD:.2f} x down</code> long,
+          <code>p_flat &lt; {settings.TRADE_SIGNAL_MAX_FLAT_PROBABILITY:.2f}</code> ve
           <code>down &gt; {settings.TRADE_SIGNAL_SIDE_RATIO_THRESHOLD:.2f} x up</code> short,
+          <code>p_flat &lt; {settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY:.2f}</code> ve
+          <code>up &gt; flat &gt; down</code> long,
+          <code>p_flat &lt; {settings.TRADE_SIGNAL_ORDERING_MAX_FLAT_PROBABILITY:.2f}</code> ve
+          <code>down &gt; flat &gt; up</code> short,
           aksi halde flat.
         </div>
         <div class="hint">
